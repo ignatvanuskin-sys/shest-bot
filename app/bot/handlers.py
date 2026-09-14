@@ -43,7 +43,7 @@ def _chat(message_or_callback) -> int:
 # ---------------- commands ----------------
 @router.message(CommandStart())
 async def cmd_start(message: Message, state, container) -> None:
-    await container.session_buffer.cancel(_uid(message))
+    container.session_buffer.cancel(_uid(message))
     await state.clear()
     await message.answer(
         "👋 LeadForge AI — собираю лиды в Google Sheets.\n\n"
@@ -196,7 +196,9 @@ async def on_edit_text(message: Message, state, container) -> None:
 
 @router.message(LeadForm.ManualEntry, F.text)
 async def on_manual_text(message: Message, state, container) -> None:
-    await flow.process_manual_message(container, _chat(message), state, message.text)
+    await flow.process_manual_message(
+        container, _uid(message), _chat(message), state, message.text
+    )
 
 
 # Idle: any text starts a new collection.

@@ -5,7 +5,10 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-SourceGuess = Literal["2gis", "instagram", "website", "google", "other", None]
+# NOTE: "manual" is produced by the manual-entry fallback (app.bot.flow
+# .build_manual_result), so it must be a valid value here even though the LLM
+# prompt's enum (app.services.extraction.JSON_SCHEMA) does not offer it.
+SourceGuess = Literal["2gis", "instagram", "website", "google", "other", "manual", None]
 
 
 class ExtractionResult(BaseModel):

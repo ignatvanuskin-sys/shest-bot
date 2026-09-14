@@ -226,7 +226,7 @@ async def start_manual_entry(
 
 
 async def process_manual_message(
-    container, chat_id: int, state: FSMContext, text: str
+    container, user_id: int, chat_id: int, state: FSMContext, text: str
 ) -> None:
     data = await state.get_data()
     step = data.get("manual_step")
@@ -245,7 +245,7 @@ async def process_manual_message(
         if extracted.has_minimum():
             await show_review(container, chat_id, state, extracted, session_id)
         else:
-            await cancel_collection(container, 0, state, silent=True)
+            await cancel_collection(container, user_id, state, silent=True)
             await container.bot.send_message(
                 chat_id, "Не удалось распознать компанию — пришли больше деталей."
             )

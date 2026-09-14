@@ -3,21 +3,54 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import suppress
 
 from aiogram import BaseMiddleware
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
-from aiogram.types import CallbackQuery, Message, TelegramObject
-
+from aiogram.types import (
+    CallbackQuery,
+    ChosenInlineResult,
+    InlineQuery,
+    Message,
+    TelegramObject,
+    Update,
+)
 from app.logging_config import log_json
 
 logger = logging.getLogger(__name__)
 
+# Update fields that can carry a ``from_user`` we care about.
+_USER_EVENT_FIELDS = (
+    "message",
+    "edited_message",
+    "callback_query",
+    "inline_query",
+    "chosen_inline_result",
+)
+
+# Event types that expose ``from_user`` directly.
+_USER_EVENT_TYPES = (Message, CallbackQuery, InlineQuery, ChosenInlineResult)
+
 
 def _extract_user_id(event: TelegramObject) -> int | None:
-    if isinstance(event, Message):
+    if isinstance(event, _USER_EVENT_TYPES):
         return event.from_user.id if event.from_user else None
-    if isinstance(event, CallbackQuery):
-        return event.from_user.id if event.from_user else None
+    return None
+
+
+def unwrap_user_event(event: TelegramObject) -> TelegramObject | None:
+    """Return the nested event that carries ``from_user``.
+
+    ``dp.update`` middlewares receive the whole ``Update``, not the message or
+    callback query inside it — without unwrapping, id extraction always returns
+    ``None`` and the allowlist silently allows everyone.
+    """
+    if not isinstance(event, Update):
+        return event
+    for field in _USER_EVENT_FIELDS:
+        nested = getattr(event, field, None)
+        if nested is not None:
+            return nested
     return None
 
 
@@ -35,7 +68,8 @@ class AllowlistMiddleware(BaseMiddleware):
         self._warned: set[int] = set()
 
     async def __call__(self, handler, event, data):
-        user_id = _extract_user_id(event)
+        user_event = unwrap_user_event(event)
+        user_id = _extract_user_id(user_event) if user_event is not None else None
         if user_id is None:
             return await handler(event, data)
 
@@ -57,11 +91,9 @@ class AllowlistMiddleware(BaseMiddleware):
                     telegram_user_id=user_id, action="allowlist_blocked",
                 )
             await self._container.bot.send_message(user_id, "Это приватный бот.")
-        if isinstance(event, CallbackQuery):
-            try:
-                await self._container.bot.answer_callback_query(event.id)
-            except Exception:
-                pass
+        if isinstance(user_event, CallbackQuery):
+            with suppress(Exception):
+                await self._container.bot.answer_callback_query(user_event.id)
         return
 
 
