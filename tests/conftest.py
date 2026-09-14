@@ -52,7 +52,7 @@ class FakeBot:
     def __init__(self):
         self.sent: list[tuple] = []
 
-    async def send_message(self, chat_id, text, reply_markup=None):
+    async def send_message(self, chat_id, text, reply_markup=None, **kwargs):
         self.sent.append((chat_id, text, reply_markup))
         return SimpleNamespace(message_id=len(self.sent))
 

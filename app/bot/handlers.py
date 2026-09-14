@@ -4,8 +4,10 @@ from __future__ import annotations
 import logging
 
 from aiogram import F, Router
+from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.types import CallbackQuery, Message
+from aiogram.utils.markdown import html_decoration
 
 from app.bot import flow
 from app.bot.keyboards import (
@@ -21,6 +23,7 @@ from app.bot.keyboards import (
     EDIT_FIELDS,
     fields_keyboard,
 )
+from app.bot.premium import emoji
 from app.bot.states import LeadForm
 from app.schemas.extraction import ExtractionResult
 
@@ -46,10 +49,11 @@ async def cmd_start(message: Message, state, container) -> None:
     container.session_buffer.cancel(_uid(message))
     await state.clear()
     await message.answer(
-        "👋 LeadForge AI — собираю лиды в Google Sheets.\n\n"
+        f"{emoji('bot')} LeadForge AI — собираю лиды в Google Sheets.\n\n"
         "Просто пришлите текст о компании (из 2GIS / Instagram / сайта) одним или "
         "несколькими сообщениями подряд — бот сам распознает данные и покажет карточку.\n\n"
-        "Команды: /help"
+        "Команды: /help",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -94,32 +98,38 @@ async def cmd_last(message: Message, container) -> None:
         await message.answer("Пока нет добавленных лидов.")
         return
     lines = [_lead_short(lead) for lead in leads]
-    await message.answer("Последние лиды:\n\n" + "\n\n".join(lines))
+    await message.answer(
+        "Последние лиды:\n\n" + "\n\n".join(lines), parse_mode=ParseMode.HTML
+    )
 
 
 @router.message(Command("search"))
 async def cmd_search(message: Message, container, command: CommandObject) -> None:
     query = (command.args or "").strip()
     if not query:
-        await message.answer("Использование: /search <название/телефон/instagram/сайт>")
+        await message.answer(
+            "Использование: /search &lt;название/телефон/instagram/сайт&gt;",
+            parse_mode=ParseMode.HTML,
+        )
         return
     leads = await container.leads.search_leads(_uid(message), query)
     if not leads:
         await message.answer("Ничего не найдено.")
         return
     lines = [_lead_short(lead) for lead in leads]
-    await message.answer("Найдено:\n\n" + "\n\n".join(lines))
+    await message.answer("Найдено:\n\n" + "\n\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message, container) -> None:
     stats = await container.leads.get_stats(_uid(message))
     await message.answer(
-        f"📊 Статистика:\n"
+        f"{emoji('stats')} Статистика:\n"
         f"• Лидов всего: {stats['total']}\n"
         f"• За неделю: {stats['week']}\n"
         f"• Объединено дублей: {stats['duplicates']}\n"
-        f"• Расход на AI: ${stats['cost_usd']:.6f}"
+        f"• Расход на AI: ${stats['cost_usd']:.6f}",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -138,11 +148,12 @@ async def cmd_settings(message: Message, container) -> None:
         else "не задана"
     )
     await message.answer(
-        "⚙️ Настройки:\n"
-        f"• Город по умолчанию: {settings.DEFAULT_CITY}\n"
+        f"{emoji('settings')} Настройки:\n"
+        f"• Город по умолчанию: {html_decoration.quote(str(settings.DEFAULT_CITY))}\n"
         f"• Уведомления о дублях: включены\n"
-        f"• Таблица: {sheet_link}\n\n"
-        "Значения задаются через переменные окружения (.env)."
+        f"• Таблица: {html_decoration.quote(sheet_link)}\n\n"
+        "Значения задаются через переменные окружения (.env).",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -152,14 +163,20 @@ async def cmd_resync(message: Message, container) -> None:
     if not leads:
         await message.answer("Нет лидов, ожидающих синхронизации.")
         return
-    await message.answer(f"Синхронизирую {len(leads)} лид(ов)…")
+    await message.answer(
+        f"{emoji('collecting')} Синхронизирую {len(leads)} лид(ов)…",
+        parse_mode=ParseMode.HTML,
+    )
     done = 0
     for lead in leads:
         row = await container.sheets.sync_lead(lead)
         if row:
             await container.leads.update_lead(lead.id, sheet_row=row)
             done += 1
-    await message.answer(f"✅ Синхронизировано: {done}/{len(leads)}.")
+    await message.answer(
+        f"{emoji('check')} Синхронизировано: {done}/{len(leads)}.",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 # ---------------- collection (buffer) ----------------
@@ -170,7 +187,11 @@ async def on_collecting_text(message: Message, state, container) -> None:
 
 @router.message(LeadForm.Reviewing, F.text)
 async def on_review_text(message: Message) -> None:
-    await message.answer("Используйте кнопки под карточкой: ✅ Добавить / ✏️ Исправить / ❌ Отмена.")
+    await message.answer(
+        f"Используйте кнопки под карточкой: {emoji('check')} Добавить / "
+        f"{emoji('pencil')} Исправить / {emoji('cross')} Отмена.",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.message(LeadForm.ConfirmingDuplicate, F.text)
@@ -231,7 +252,11 @@ async def cb_edit(callback: CallbackQuery, state) -> None:
     await callback.answer()
     await state.set_state(LeadForm.EditingField)
     await state.update_data(editing_field=None)
-    await callback.message.answer("Какое поле исправить?", reply_markup=fields_keyboard())
+    await callback.message.answer(
+        f"{emoji('pencil')} Какое поле исправить?",
+        reply_markup=fields_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.callback_query(F.data == CB_EDIT_DONE)
@@ -248,8 +273,11 @@ async def cb_select_field(callback: CallbackQuery, state) -> None:
     await callback.answer()
     field = callback.data[len(CB_FIELD_PREFIX):]
     await state.update_data(editing_field=field)
+    label = FIELD_LABELS.get(field, field)
     await callback.message.answer(
-        f"Введите новое значение для «{FIELD_LABELS.get(field, field)}»:"
+        f"{emoji('pencil')} Введите новое значение для "
+        f"«{html_decoration.quote(str(label))}»:",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -274,15 +302,16 @@ async def cb_dup_contact(callback: CallbackQuery, state, container) -> None:
 
 
 def _lead_short(lead) -> str:
+    """One-line lead summary; HTML (escaped) because the caller sends it as HTML."""
     parts = [f"#{lead.id}"]
     if lead.company_name:
-        parts.append(lead.company_name)
+        parts.append(f"{emoji('company')} {html_decoration.quote(str(lead.company_name))}")
     if lead.city:
-        parts.append(lead.city)
+        parts.append(f"{emoji('city')} {html_decoration.quote(str(lead.city))}")
     if lead.phone:
-        parts.append(lead.phone)
+        parts.append(f"{emoji('phone')} {html_decoration.quote(str(lead.phone))}")
     if lead.instagram:
-        parts.append(f"@{lead.instagram}")
+        parts.append(f"{emoji('instagram')} @{html_decoration.quote(str(lead.instagram))}")
     if lead.sheet_row:
-        parts.append(f"строка {lead.sheet_row}")
+        parts.append(f"{emoji('row')} строка {html_decoration.quote(str(lead.sheet_row))}")
     return " — ".join(parts)

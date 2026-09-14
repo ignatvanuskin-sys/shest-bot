@@ -5,10 +5,13 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
+from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
+from aiogram.utils.markdown import html_decoration
 
 from app.bot.cards import render_card, render_lead_summary
 from app.bot.keyboards import collecting_keyboard, duplicate_keyboard, review_keyboard
+from app.bot.premium import emoji
 from app.bot.states import LeadForm
 from app.logging_config import set_session_id
 from app.schemas.extraction import ExtractionResult
@@ -19,12 +22,13 @@ from app.services.normalize import normalize_phone, normalize_social_handle, nor
 logger = logging.getLogger(__name__)
 
 MANUAL_STEPS = ("company_name", "phone", "city", "website", "instagram")
+# HTML: sent with parse_mode=HTML, so the prompts must never contain raw markup.
 MANUAL_PROMPTS = {
-    "company_name": "Введите название компании:",
-    "phone": "Введите телефон (или «-», чтобы пропустить):",
-    "city": "Введите город (или «-»):",
-    "website": "Введите сайт (или «-»):",
-    "instagram": "Введите Instagram (или «-»):",
+    "company_name": f"{emoji('company')} Введите название компании:",
+    "phone": f"{emoji('phone')} Введите телефон (или «-», чтобы пропустить):",
+    "city": f"{emoji('city')} Введите город (или «-»):",
+    "website": f"{emoji('website')} Введите сайт (или «-»):",
+    "instagram": f"{emoji('instagram')} Введите Instagram (или «-»):",
 }
 
 
@@ -43,8 +47,10 @@ async def start_collection(
     )
     await container.bot.send_message(
         chat_id,
-        "📥 Собираю лид… отправьте ещё текст или нажмите ✅ Готово.",
+        f"{emoji('collecting')} Собираю лид… отправьте ещё текст или нажмите "
+        f"{emoji('check')} Готово.",
         reply_markup=collecting_keyboard(),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -77,7 +83,9 @@ async def cancel_collection(
         await container.leads.update_session(session_id, status="cancelled")
     await state.clear()
     if not silent and chat_id is not None:
-        await container.bot.send_message(chat_id, "❌ Отменено.")
+        await container.bot.send_message(
+            chat_id, f"{emoji('cross')} Отменено.", parse_mode=ParseMode.HTML
+        )
 
 
 async def finalize_collection(container, user_id: int, chat_id: int, state: FSMContext) -> None:
@@ -97,7 +105,9 @@ async def finalize_collection(container, user_id: int, chat_id: int, state: FSMC
         session_id, combined_text=combined, status="review",
         last_message_at=datetime.now(timezone.utc),
     )
-    await container.bot.send_message(chat_id, "🔎 Анализирую…")
+    await container.bot.send_message(
+        chat_id, f"{emoji('analyzing')} Анализирую…", parse_mode=ParseMode.HTML
+    )
 
     set_session_id(str(session_id))
     try:
@@ -108,11 +118,16 @@ async def finalize_collection(container, user_id: int, chat_id: int, state: FSMC
         reason = str(exc)
         if "OPENROUTER_API_KEY" in reason:
             await container.bot.send_message(
-                chat_id, "⚠️ LLM не настроен (нет OPENROUTER_API_KEY). Могу ввести вручную."
+                chat_id,
+                f"{emoji('warning')} LLM не настроен (нет OPENROUTER_API_KEY). "
+                "Могу ввести вручную.",
+                parse_mode=ParseMode.HTML,
             )
         else:
             await container.bot.send_message(
-                chat_id, "⚠️ Не удалось распознать автоматически. Введём вручную."
+                chat_id,
+                f"{emoji('warning')} Не удалось распознать автоматически. Введём вручную.",
+                parse_mode=ParseMode.HTML,
             )
         await start_manual_entry(container, chat_id, state, session_id)
         set_session_id(None)
@@ -139,7 +154,9 @@ async def finalize_collection(container, user_id: int, chat_id: int, state: FSMC
         asyncio.create_task(sync_and_notify(container, lead.id, chat_id))
         await state.clear()
         await container.bot.send_message(
-            chat_id, f"✅ Найдено совпадение — обновлён лид #{match.lead_id}."
+            chat_id,
+            f"{emoji('check')} Найдено совпадение — обновлён лид #{match.lead_id}.",
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -152,11 +169,15 @@ async def finalize_collection(container, user_id: int, chat_id: int, state: FSMC
             duplicate={"lead_id": match.lead_id, "reason": match.reason, "score": match.score},
         )
         text = (
-            f"⚠️ Похоже на уже существующий лид ({match.reason}).\n\n"
+            f"{emoji('warning')} Похоже на уже существующий лид "
+            f"({html_decoration.quote(str(match.reason))}).\n\n"
             f"Новая карточка:\n{render_card(extracted)}\n\n"
-            f"Существующий лид:\n{render_lead_summary(existing) if existing else '#' + str(match.lead_id)}"
+            f"Существующий лид:\n"
+            f"{render_lead_summary(existing) if existing else '#' + str(match.lead_id)}"
         )
-        await container.bot.send_message(chat_id, text, reply_markup=duplicate_keyboard())
+        await container.bot.send_message(
+            chat_id, text, reply_markup=duplicate_keyboard(), parse_mode=ParseMode.HTML
+        )
         return
 
     await show_review(container, chat_id, state, extracted, session_id)
@@ -168,7 +189,10 @@ async def show_review(
     await state.set_state(LeadForm.Reviewing)
     await state.update_data(extracted=extracted.model_dump(), session_id=session_id)
     await container.bot.send_message(
-        chat_id, render_card(extracted), reply_markup=review_keyboard(extracted.has_minimum())
+        chat_id,
+        render_card(extracted),
+        reply_markup=review_keyboard(extracted.has_minimum()),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -178,13 +202,18 @@ async def confirm_add(container, user_id: int, chat_id: int, state: FSMContext) 
     session_id = data.get("session_id")
     if not extracted.has_minimum():
         await container.bot.send_message(
-            chat_id, "⚠️ Заполните название или хотя бы один контакт (✏️ Исправить)."
+            chat_id,
+            f"{emoji('warning')} Заполните название или хотя бы один контакт "
+            f"({emoji('pencil')} Исправить).",
+            parse_mode=ParseMode.HTML,
         )
         return
     lead = await container.leads.add_lead(user_id, extracted, session_id)
     asyncio.create_task(sync_and_notify(container, lead.id, chat_id))
     await state.clear()
-    await container.bot.send_message(chat_id, f"✅ Лид добавлен — ID #{lead.id}.")
+    await container.bot.send_message(
+        chat_id, f"{emoji('check')} Лид добавлен — ID #{lead.id}.", parse_mode=ParseMode.HTML
+    )
 
 
 async def handle_duplicate_choice(
@@ -200,7 +229,11 @@ async def handle_duplicate_choice(
         lead = await container.leads.add_lead(user_id, extracted, session_id)
         asyncio.create_task(sync_and_notify(container, lead.id, chat_id))
         await state.clear()
-        await container.bot.send_message(chat_id, f"✅ Лид добавлен — ID #{lead.id}.")
+        await container.bot.send_message(
+            chat_id,
+            f"{emoji('check')} Лид добавлен — ID #{lead.id}.",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     prefer_new_contact = choice == "contact"
@@ -211,7 +244,9 @@ async def handle_duplicate_choice(
     asyncio.create_task(sync_and_notify(container, lead.id, chat_id))
     await state.clear()
     await container.bot.send_message(
-        chat_id, f"✅ Объединено с лидом #{existing_id}."
+        chat_id,
+        f"{emoji('check')} Объединено с лидом #{existing_id}.",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -222,7 +257,9 @@ async def start_manual_entry(
     await state.update_data(
         session_id=session_id, manual_step="company_name", manual={}
     )
-    await container.bot.send_message(chat_id, MANUAL_PROMPTS["company_name"])
+    await container.bot.send_message(
+        chat_id, MANUAL_PROMPTS["company_name"], parse_mode=ParseMode.HTML
+    )
 
 
 async def process_manual_message(
@@ -252,7 +289,9 @@ async def process_manual_message(
         return
 
     await state.update_data(manual=manual, manual_step=next_step)
-    await container.bot.send_message(chat_id, MANUAL_PROMPTS[next_step])
+    await container.bot.send_message(
+        chat_id, MANUAL_PROMPTS[next_step], parse_mode=ParseMode.HTML
+    )
 
 
 def build_manual_result(manual: dict, default_city: str) -> ExtractionResult:
@@ -299,12 +338,17 @@ async def sync_and_notify(container, lead_id: int, chat_id: int) -> None:
         row = await container.sheets.sync_lead(lead)
         if row:
             await container.leads.update_lead(lead_id, sheet_row=row)
-            await container.bot.send_message(chat_id, f"📄 Строка #{row} в таблице готова.")
+            await container.bot.send_message(
+                chat_id,
+                f"{emoji('row')} Строка #{row} в таблице готова.",
+                parse_mode=ParseMode.HTML,
+            )
         else:
             await container.bot.send_message(
                 chat_id,
-                "✅ Добавлено в базу, синхронизация с таблицей чуть задержится. "
-                "Позже выполните /resync.",
+                f"{emoji('check')} Добавлено в базу, синхронизация с таблицей чуть "
+                "задержится. Позже выполните /resync.",
+                parse_mode=ParseMode.HTML,
             )
     except Exception:
         logger.exception("sync_and_notify failed for lead %s", lead_id)

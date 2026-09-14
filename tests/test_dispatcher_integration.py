@@ -8,21 +8,30 @@ therefore missed a production 500: ``cmd_start`` awaited a *synchronous*
 Everything here goes through ``Dispatcher.feed_update`` with updates parsed from
 raw Telegram JSON, exactly like ``app.main.webhook``. No test opens a network
 connection (see the ``no_network`` guard).
+
+Premium emoji are covered here as well: every message carrying a
+``<tg-emoji>`` tag must be sent with ``parse_mode=HTML``, and every button must
+carry a custom-emoji icon with a clean, emoji-free label.
 """
 from __future__ import annotations
 
 import socket
 
 import pytest
+from aiogram.enums import ParseMode
 
-from app.bot.keyboards import CB_ADD, CB_DUP_NEW
+from app.bot.keyboards import CB_ADD, CB_CANCEL, CB_DONE, CB_DUP_NEW, CB_EDIT, CB_EDIT_DONE
+from app.bot.premium import EMOJI_IDS
 from app.bot.states import LeadForm
 from app.schemas.extraction import ExtractionResult
 from app.services.extraction import ExtractionError
 from tests.integration_harness import (
     OWNER_USER_ID,
     STRANGER_USER_ID,
+    assert_valid_telegram_html,
+    has_plain_emoji,
     harness,  # noqa: F401  — imported fixture
+    iter_buttons,
     wait_until,
 )
 
@@ -87,6 +96,10 @@ async def test_start_cancels_pending_buffer_and_greets(harness):
     assert harness.bot.contains("LeadForge AI")
     assert harness.container.session_buffer.has_pending(OWNER_USER_ID) is False
     assert await harness.fsm_state() is None
+
+    greeting = harness.bot.last_message()
+    assert greeting is not None and "<tg-emoji emoji-id=" in greeting.text
+    assert greeting.parse_mode == ParseMode.HTML
 
 
 # ---------------- every documented command ----------------
@@ -323,3 +336,107 @@ async def test_medium_duplicate_asks_before_creating(harness):
 
     await harness.tap(CB_DUP_NEW)
     assert await harness.lead_count() == 2
+
+
+# ---------------- premium emoji ----------------
+async def test_premium_emoji_messages_are_sent_with_html_parse_mode(harness):
+    """A <tg-emoji> tag only renders when the message is HTML — never plain text."""
+    harness.extraction._results = [full_result()]
+
+    await harness.send_command("/start")
+    await harness.send_text("ТОО Ромашка, Алматы, +7 700 123 45 67")
+    await harness.send_command("/done")
+    await harness.tap(CB_EDIT)  # fields keyboard
+    await harness.tap(CB_EDIT_DONE)  # back to the review card
+    await harness.tap(CB_ADD)
+    assert await wait_until(lambda: len(harness.sheets.synced) == 1)
+    await harness.send_command("/stats")
+    await harness.send_command("/settings")
+    await harness.send_command("/last")
+    await harness.send_command("/resync")
+
+    premium = harness.bot.premium_messages()
+    assert len(premium) >= 6, "expected premium emoji in start/review/cancel/sync messages"
+    for call in premium:
+        assert call.parse_mode == ParseMode.HTML, (
+            f"premium emoji sent without parse_mode=HTML: {call.text!r}"
+        )
+        assert_valid_telegram_html(call.text)
+
+
+async def test_action_buttons_use_custom_emoji_icon_and_clean_text(harness):
+    """Buttons keep their old label but move the icon into icon_custom_emoji_id."""
+    harness.extraction._results = [full_result()]
+
+    await harness.send_text("ТОО Ромашка, Алматы, +7 700 123 45 67")
+    await harness.send_command("/done")
+    await harness.tap(CB_EDIT)
+
+    buttons = {b.callback_data: b for b in harness.bot.all_buttons() if b.callback_data}
+    assert buttons[CB_DONE].text == "Готово"
+    assert buttons[CB_CANCEL].text == "Отмена"
+    assert buttons[CB_ADD].text == "Добавить"
+    assert buttons[CB_EDIT].text == "Исправить"
+
+    assert buttons[CB_DONE].icon_custom_emoji_id == EMOJI_IDS["check"]
+    assert buttons[CB_CANCEL].icon_custom_emoji_id == EMOJI_IDS["cross"]
+    assert buttons[CB_ADD].icon_custom_emoji_id == EMOJI_IDS["check"]
+    assert buttons[CB_EDIT].icon_custom_emoji_id == EMOJI_IDS["pencil"]
+
+    for button in harness.bot.all_buttons():
+        assert not has_plain_emoji(button.text), f"plain emoji in button {button.text!r}"
+        assert button.icon_custom_emoji_id and button.icon_custom_emoji_id.isdigit()
+
+    # The "Исправить" keyboard is fully icon-driven too.
+    field_buttons = [b for b in iter_buttons(harness.bot.last_reply_markup())]
+    assert field_buttons and all(b.icon_custom_emoji_id for b in field_buttons)
+
+
+async def test_html_characters_in_lead_data_are_escaped(harness):
+    """Escaping regression: a company name with <, & and > must not break the card."""
+    hostile_name = 'ООО "<Ромашка>" & Co'
+    harness.extraction._results = [
+        ExtractionResult(
+            company_name=hostile_name,
+            city="Алматы",
+            description="5 < 7 и 9 > 8, скидка & подарок",
+            services=["<b>услуга</b>"],
+            uncertain_fields=["<script>city</script>"],
+        )
+    ]
+
+    await harness.send_text('ТОО "<Ромашка>" & Co, Алматы')
+    await harness.send_command("/done")
+
+    card = harness.bot.last_message().text
+    assert 'ООО "&lt;Ромашка&gt;" &amp; Co' in card
+    assert "<Ромашка>" not in card and "<script>" not in card
+    assert_valid_telegram_html(card)
+
+    # Same data through the review → save → /last report path.
+    await harness.tap(CB_ADD)
+    await harness.send_command("/last")
+
+    report = harness.bot.last_message().text
+    assert "&lt;Ромашка&gt;" in report
+    assert_valid_telegram_html(report)
+    assert (await harness.leads())[0].company_name == hostile_name
+
+
+async def test_duplicate_prompt_escapes_existing_lead_summary(harness):
+    hostile_name = 'ООО "<Ромашка>" & Co'
+    harness.extraction._results = [ExtractionResult(company_name=hostile_name, city="Алматы")]
+    await harness.send_text('ТОО "<Ромашка>" & Co')
+    await harness.send_command("/done")
+    await harness.tap(CB_ADD)
+    assert await harness.lead_count() == 1
+
+    harness.extraction._results = [ExtractionResult(company_name=hostile_name, city="Алматы")]
+    await harness.send_text("снова та же компания")
+    await harness.send_command("/done")
+
+    assert await harness.fsm_state() == LeadForm.ConfirmingDuplicate.state
+    prompt = harness.bot.last_message().text
+    assert "Похоже на уже существующий лид" in prompt
+    assert "<Ромашка>" not in prompt
+    assert_valid_telegram_html(prompt)

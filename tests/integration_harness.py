@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import re
+import xml.etree.ElementTree as ElementTree
 from contextlib import suppress
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -39,6 +41,61 @@ STRANGER_USER_ID = 999999
 
 BASE_DATE = 1_700_000_000
 
+# A premium (custom) emoji looks like <tg-emoji emoji-id="123">✅</tg-emoji>.
+TG_EMOJI_RE = re.compile(r'<tg-emoji emoji-id="(\d+)">(.*?)</tg-emoji>')
+
+# Ranges that cover every plain emoji the bot used before the premium ones
+# (✅ U+2705, ❌ U+274C, ✏ U+270F, ⏰ U+23F0, 👋/📊/… U+1F000+). Deliberately
+# excludes U+2000–U+206F so «» — … and → in Russian copy are not false positives.
+PLAIN_EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\u2300-\u23FF\uFE0F]"
+)
+
+
+def iter_buttons(reply_markup):
+    """Flatten an inline (or reply) markup into its buttons."""
+    if reply_markup is None:
+        return []
+    rows = getattr(reply_markup, "inline_keyboard", None)
+    if rows is None:
+        rows = getattr(reply_markup, "keyboard", None) or []
+    return [button for row in rows for button in row]
+
+
+def has_plain_emoji(text: str | None) -> bool:
+    return bool(text) and bool(PLAIN_EMOJI_RE.search(text))
+
+
+def find_plain_emoji(text: str) -> list[str]:
+    """Plain emoji left *outside* premium tags — i.e. a missed replacement."""
+    return PLAIN_EMOJI_RE.findall(TG_EMOJI_RE.sub("", text))
+
+
+def find_raw_angles(text: str) -> list[str]:
+    """``<``/``>`` left over once premium-emoji tags are removed.
+
+    Any leftover angle bracket means user data reached an HTML message
+    unescaped — i.e. Telegram would answer 400 "can't parse entities".
+    """
+    return [char for char in TG_EMOJI_RE.sub("", text) if char in "<>"]
+
+
+def assert_valid_telegram_html(text: str) -> None:
+    """Assert *text* survives Telegram's HTML parser untouched.
+
+    Checks the two ways an HTML message breaks in production: a raw ``<``/``>``
+    from unescaped user data, and a bare ``&`` that is not a valid entity (both
+    make ElementTree fail exactly like Telegram's parser does).
+    """
+    raw = find_raw_angles(text)
+    assert not raw, f"raw angle brackets in HTML message: {text!r}"
+    leftovers = find_plain_emoji(text)
+    assert not leftovers, f"plain emoji outside a premium tag: {leftovers!r} in {text!r}"
+    try:
+        ElementTree.fromstring(f"<root>{text}</root>")
+    except ElementTree.ParseError as exc:  # pragma: no cover - only on a regression
+        raise AssertionError(f"not valid Telegram HTML ({exc}): {text!r}") from exc
+
 
 @dataclass
 class OutgoingCall:
@@ -50,6 +107,7 @@ class OutgoingCall:
     reply_markup: object | None = None
     callback_query_id: str | None = None
     payload: object | None = None
+    parse_mode: object | None = None
 
 
 class RecordingBot:
@@ -68,10 +126,16 @@ class RecordingBot:
         self._message_id = 0
 
     # ---- direct API ----
-    async def send_message(self, chat_id, text, reply_markup=None, **kwargs):
+    async def send_message(self, chat_id, text, reply_markup=None, parse_mode=None, **kwargs):
         self._message_id += 1
         self.calls.append(
-            OutgoingCall("send_message", chat_id=chat_id, text=text, reply_markup=reply_markup)
+            OutgoingCall(
+                "send_message",
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+            )
         )
         return SimpleNamespace(message_id=self._message_id)
 
@@ -90,7 +154,10 @@ class RecordingBot:
         title = type(method).__name__
         if title == "SendMessage":
             return await self.send_message(
-                method.chat_id, method.text, getattr(method, "reply_markup", None)
+                method.chat_id,
+                method.text,
+                getattr(method, "reply_markup", None),
+                getattr(method, "parse_mode", None),
             )
         if title == "AnswerCallbackQuery":
             return await self.answer_callback_query(
@@ -121,6 +188,20 @@ class RecordingBot:
 
     def contains(self, needle: str) -> bool:
         return any(needle in text for text in self.texts())
+
+    def premium_messages(self) -> list[OutgoingCall]:
+        """Sent messages that actually carry a premium emoji tag."""
+        return [call for call in self.messages() if call.text and TG_EMOJI_RE.search(call.text)]
+
+    def premium_texts(self) -> list[str]:
+        return [call.text for call in self.premium_messages()]
+
+    def messages_with_markup(self) -> list[OutgoingCall]:
+        return [call for call in self.messages() if call.reply_markup is not None]
+
+    def all_buttons(self) -> list:
+        """Every button of every keyboard sent so far."""
+        return [button for call in self.messages() for button in iter_buttons(call.reply_markup)]
 
 
 class ScriptedExtraction:
