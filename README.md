@@ -139,6 +139,19 @@ OPENROUTER_FALLBACK_MODEL=liquid/lfm-2.5-2.6b:free
 5. Скопируйте URL вида `https://script.google.com/macros/s/…/exec` в `GOOGLE_SHEETS_WEBHOOK_URL`,
    а значение `TOKEN` — в `GOOGLE_SHEETS_WEBHOOK_TOKEN`.
 
+**Если проект создан отдельно от таблицы (standalone).** Шаги 1–5 выше описывают контейнерный
+скрипт, созданный из самой таблицы. Если вместо этого вы зашли на `script.google.com` и создали
+проект там, активной таблицы у скрипта нет — задайте в начале скрипта константу
+`SPREADSHEET_ID`: возьмите её из адреса таблицы (часть между `/d/` и `/edit`, например
+`https://docs.google.com/spreadsheets/d/1AbCdEf1234567890/edit#gid=0` → `1AbCdEf1234567890`).
+Остальные шаги (деплой Web App и перенос URL/токена в `.env`) те же.
+
+**Проверка деплоя.** Откройте URL `/exec` прямо в браузере — это GET-запрос, и скрипт должен
+вернуть `{"ok":true,"service":"leadforge-webhook"}`. Такой ответ означает, что развёртывание
+работает. Если браузер просит войти в Google — доступ выставлен не «все, у кого есть ссылка».
+Если вернулось `{"ok":false,...}` — деплой жив, но скрипт не видит таблицу: проверьте
+`SPREADSHEET_ID` и имя листа `SHEET_NAME`.
+
 Выбор бэкенда автоматический: задан `GOOGLE_SERVICE_ACCOUNT_JSON` → gspread (путь A); иначе задан
 `GOOGLE_SHEETS_WEBHOOK_URL` → webhook (путь B); иначе синхронизация «не настроена» — лид сохраняется
 в SQLite с `sheet_row=NULL` и досинхронизируется командой `/resync`.

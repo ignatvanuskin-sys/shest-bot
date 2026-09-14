@@ -1,14 +1,37 @@
 /**
  * LeadForge AI — Google Sheets webhook (Apps Script).
  *
- * Как деплоить (2 минуты, без GCP/карты):
+ * Скрипт поддерживает два варианта развёртывания.
+ *
+ * Вариант 1 — скрипт создан ИЗ таблицы (контейнерный):
  *   1. Откройте целевую таблицу → Расширения → Apps Script.
  *   2. Вставьте этот код целиком и замените TOKEN на свой случайный секрет.
- *   3. Деплой → Новое развертывание → тип «Веб-приложение».
+ *   3. SPREADSHEET_ID можно оставить пустым ("") — таблица определяется
+ *      автоматически как активная таблица контейнера.
+ *   4. Деплой → Новое развертывание → тип «Веб-приложение».
  *      - «Выполнять как»: я
  *      - «Доступ»: все, у кого есть ссылка
- *   4. Скопируйте URL /exec в GOOGLE_SHEETS_WEBHOOK_URL, а TOKEN — в
+ *   5. Скопируйте URL /exec в GOOGLE_SHEETS_WEBHOOK_URL, а TOKEN — в
  *      GOOGLE_SHEETS_WEBHOOK_TOKEN.
+ *
+ * Вариант 2 — скрипт создан ОТДЕЛЬНО от таблицы (standalone, script.google.com):
+ *   1. Откройте script.google.com → Новый проект.
+ *   2. Вставьте этот код целиком и замените TOKEN на свой случайный секрет.
+ *   3. Обязательно заполните SPREADSHEET_ID: это ID таблицы из её адреса —
+ *      часть между /d/ и /edit, например для адреса
+ *        https://docs.google.com/spreadsheets/d/1AbCdEf1234567890/edit#gid=0
+ *      ID будет 1AbCdEf1234567890.
+ *      Без SPREADSHEET_ID standalone-скрипт не видит таблицу и вернёт ошибку.
+ *   4. Деплой → Новое развертывание → тип «Веб-приложение» (те же настройки,
+ *      что и в варианте 1).
+ *
+ * Как проверить, что деплой работает:
+ *   Откройте URL /exec прямо в браузере (GET-запрос). Должен вернуться JSON
+ *   {"ok":true,"service":"leadforge-webhook"} — это значит, что приложение
+ *   развёрнуто и доступно. Если вместо этого страница логина Google — проверьте,
+ *   что «Доступ» выставлен в «все, у кого есть ссылка». Если браузер показывает
+ *   {"ok":false,...} — скрипт развёрнут, но не видит таблицу: проверьте
+ *   SPREADSHEET_ID и имя листа SHEET_NAME.
  *
  * Протокол: python-клиент шлёт POST с Content-Type: text/plain, телом — JSON-строкой
  * (важно: НЕ application/json — иначе /exec ответит 302-редиректом). Скрипт читает
@@ -16,6 +39,11 @@
  */
 
 var TOKEN = "ЗАМЕНИТЕ_НА_СВОЙ_ТОКЕН";
+
+// ID таблицы (standalone-развёртывание). Пустая строка = взять активную таблицу
+// (работает только если скрипт создан из таблицы через Расширения → Apps Script).
+var SPREADSHEET_ID = "";
+
 var SHEET_NAME = "Leads";
 var COLUMN_COUNT = 27;
 
@@ -100,8 +128,26 @@ function doPost(e) {
   }
 }
 
+// GET /exec — проверка развёртывания: откройте URL в браузере.
+function doGet(e) {
+  var out = ContentService.createTextOutput();
+  out.setMimeType(ContentService.MimeType.JSON);
+  out.setContent(JSON.stringify({ ok: true, service: "leadforge-webhook" }));
+  return out;
+}
+
 function getSheet() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ss = SPREADSHEET_ID
+    ? SpreadsheetApp.openById(SPREADSHEET_ID)
+    : SpreadsheetApp.getActiveSpreadsheet();
+
+  if (!ss) {
+    throw new Error(
+      "Скрипт не видит таблицу. Укажите SPREADSHEET_ID (ID таблицы — часть адреса " +
+      "между /d/ и /edit) либо создайте скрипт из таблицы через Расширения → Apps Script."
+    );
+  }
+
   var sheet = ss.getSheetByName(SHEET_NAME);
   if (!sheet) {
     sheet = ss.getActiveSheet();
