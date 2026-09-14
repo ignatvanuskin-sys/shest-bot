@@ -1,0 +1,49 @@
+# Build context exclusions for the Docker image.
+
+# Version control / CI
+.git
+.gitignore
+.github
+
+# Secrets — never baked into an image
+.env
+.env.*
+!.env.example
+
+# Virtualenvs and Python caches
+.venv
+venv
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Local database, WAL/SHM sidecars and logs
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+*.log
+logs/
+bot-run.log
+
+# Not needed at runtime
+tests
+docs
+
+# Docker / Railway config (read from the repo, not from the image)
+Dockerfile
+.dockerignore
+railway.toml
+railway.json
+.railwayignore
+
+# IDE / OS noise
+.idea
+.vscode
+.DS_Store
+Thumbs.db

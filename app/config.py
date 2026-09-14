@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     WEBHOOK_URL: str = ""
     WEBHOOK_SECRET: str = ""
 
+    # Railway injects this automatically for services with a public domain.
+    # Used to build WEBHOOK_URL when it is left empty in webhook mode.
+    RAILWAY_PUBLIC_DOMAIN: str = ""
+
     # LLM (OpenRouter)
     OPENROUTER_API_KEY: str = ""
     OPENROUTER_MODEL: str = "openrouter/free"

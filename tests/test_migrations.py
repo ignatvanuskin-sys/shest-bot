@@ -107,3 +107,27 @@ async def test_startup_runtime_migrates_inside_running_loop(tmp_database_url):
     await startup_runtime(container)
 
     assert_schema_created(db_path)
+
+
+async def test_migrations_do_not_disable_app_loggers(tmp_database_url):
+    """Alembic's fileConfig() must not switch off loggers that already exist.
+
+    Migrations run inside the application process at startup; with the default
+    ``disable_existing_loggers=True`` every app logger (app.main, app.bot.* …)
+    was silently disabled, hiding the webhook-registration log and all runtime
+    logging that follows it.
+    """
+    import logging
+    from types import SimpleNamespace
+
+    from app.main import startup_runtime
+
+    _, db_path = tmp_database_url
+    logger = logging.getLogger("app.main")
+    logger.disabled = False
+    container = SimpleNamespace(settings=SimpleNamespace(DEV_POLLING=True))
+
+    await startup_runtime(container)
+
+    assert_schema_created(db_path)
+    assert logger.disabled is False, "alembic fileConfig disabled the app logger"

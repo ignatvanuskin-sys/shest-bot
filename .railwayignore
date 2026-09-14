@@ -1,0 +1,47 @@
+# Files Railway should not upload as part of the build context.
+
+# Version control / CI
+.git
+.gitignore
+.github
+
+# Secrets — provided as service variables instead
+.env
+.env.*
+!.env.example
+
+# Virtualenvs and caches
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Local database and logs
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+*.log
+logs/
+bot-run.log
+
+# Tests and docs are not needed to build or run the service
+tests
+docs
+
+# Railway/Docker config is read from the repo, not uploaded into the image
+railway.toml
+railway.json
+.dockerignore
+.railwayignore
+
+# IDE / OS noise
+.idea
+.vscode
+.DS_Store
+Thumbs.db

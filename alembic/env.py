@@ -17,7 +17,10 @@ from app import models  # noqa: F401  — ensure models are registered on Base.m
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers=False: migrations run inside the app process at
+    # startup, and the default (True) would switch off every app logger —
+    # including the webhook-registration log emitted right after migrations.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 config.set_main_option("sqlalchemy.url", get_settings().DATABASE_URL)
 

@@ -43,6 +43,8 @@ app/
     dispatcher.py      # сборка диспетчера, set_webhook, feed_update
 alembic/               # миграции
 tests/                 # pytest
+Dockerfile             # прод-образ (python:3.11-slim) для Railway
+railway.toml           # конфиг деплоя: сборка из Dockerfile + healthcheck /health
 ```
 
 ## Настройка
@@ -63,6 +65,7 @@ DATABASE_URL=sqlite+aiosqlite:///./leadforge.db
 DEV_POLLING=false                    # true — запуск через long polling (локально)
 WEBHOOK_URL=...                      # публичный URL для webhook (production)
 WEBHOOK_SECRET=...                   # секрет для заголовка X-Telegram-Bot-Api-Secret-Token
+RAILWAY_PUBLIC_DOMAIN=...            # Railway задаёт сам; из него строится WEBHOOK_URL, если он пуст
 DEFAULT_CITY=Алматы
 COLLECT_TIMEOUT_SECONDS=7
 ```
@@ -217,7 +220,9 @@ PowerShell-вариант: в `.env` поставьте `DEV_POLLING=true`, за
 .venv/Scripts/python -m app.main
 ```
 
-Запускается uvicorn на `0.0.0.0:8080`; в lifespan выполняется регистрация webhook (нужен `WEBHOOK_URL`).
+Запускается uvicorn на `0.0.0.0:$PORT` (по умолчанию 8080); в lifespan выполняются
+миграции и регистрация webhook (`WEBHOOK_URL`, а в Railway — из `RAILWAY_PUBLIC_DOMAIN`;
+подробности — «Продакшн-деплой на Railway»).
 
 Эндпоинты:
 - `GET /health` — health-check
@@ -241,6 +246,135 @@ async def main():
 asyncio.run(main())
 PY
 ```
+
+## Продакшн-деплой на Railway
+
+Сервис собирается из `Dockerfile` (база `python:3.11-slim`) по конфигу `railway.toml`:
+builder — Dockerfile, healthcheck — `GET /health`, `numReplicas = 1` (одновременная
+обработка вебхука несколькими копиями и один файл SQLite несовместимы).
+
+```bash
+railway up            # или подключите GitHub-репозиторий к сервису
+```
+
+### Переменные окружения
+
+Задаются в Railway → Service → Variables. Имена — те же, что и в `.env`.
+
+| Переменная | Обяз. | Назначение |
+|---|---|---|
+| `BOT_TOKEN` | да | токен бота у @BotFather |
+| `ALLOWED_USER_IDS` | да | telegram id через запятую |
+| `OPENROUTER_API_KEY` | да | ключ https://openrouter.ai/keys |
+| `OPENROUTER_MODEL` | нет | по умолчанию `openrouter/free` |
+| `OPENROUTER_FALLBACK_MODEL` | нет | запасная модель |
+| `GOOGLE_SHEETS_WEBHOOK_URL` | да* | `/exec` Apps Script Web App (путь B) |
+| `GOOGLE_SHEETS_WEBHOOK_TOKEN` | да* | токен из скрипта Apps Script (путь B) |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | да* | base64 сервис-аккаунта (путь A) |
+| `GOOGLE_SHEET_ID` | да* | id таблицы (путь A) |
+| `DATABASE_URL` | да | см. «Эфемерная ФС» ниже |
+| `DEV_POLLING` | да | **`false`** в проде |
+| `WEBHOOK_SECRET` | рекоменд. | секрет для заголовка `X-Telegram-Bot-Api-Secret-Token` |
+| `WEBHOOK_URL` | нет | если пусто — соберётся из `RAILWAY_PUBLIC_DOMAIN` |
+| `DEFAULT_CITY` | нет | по умолчанию `Алматы` |
+| `COLLECT_TIMEOUT_SECONDS` | нет | по умолчанию `7` |
+
+\* нужен либо `GOOGLE_SHEETS_WEBHOOK_URL` + `GOOGLE_SHEETS_WEBHOOK_TOKEN` (путь B),
+либо `GOOGLE_SERVICE_ACCOUNT_JSON` + `GOOGLE_SHEET_ID` (путь A).
+
+Служебные переменные Railway приложению задавать не нужно — оно читает их само:
+
+- `PORT` — порт uvicorn (`app.main.resolve_port()`, по умолчанию 8080).
+- `RAILWAY_PUBLIC_DOMAIN` — публичный домен сервиса (Settings → Networking →
+  Generate Domain), включается кнопкой; из него строится `WEBHOOK_URL`.
+
+### Регистрация вебхука при старте
+
+`lifespan` → `startup_runtime()`:
+
+1. применяются миграции Alembic (идемпотентно, `alembic upgrade head`);
+2. если `DEV_POLLING=false`:
+   - `WEBHOOK_URL` задан → используется он;
+   - `WEBHOOK_URL` пуст, но есть `RAILWAY_PUBLIC_DOMAIN` → берётся
+     `https://<RAILWAY_PUBLIC_DOMAIN>/webhook`;
+   - ни то, ни другое → warning, вебхук не регистрируется;
+3. результат регистрации (успех или ошибка) пишется в лог; при ошибке контейнер не
+   падает — `/health` продолжает отвечать, а причина видна в логах.
+
+### Как убедиться, что активен именно вебхук
+
+1. В логе старта есть строки `registering webhook at https://<домен>/webhook
+   (source: RAILWAY_PUBLIC_DOMAIN)` и `webhook registration OK: ...`.
+2. Спросить Telegram напрямую:
+
+   ```bash
+   curl -s "https://api.telegram.org/bot<BOT_TOKEN>/getWebhookInfo"
+   ```
+
+   Ожидаем `"url": "https://<домен>/webhook"` и `pending_update_count` около нуля.
+3. Локальный polling остановлен: в проде `DEV_POLLING=false`, поэтому `run_polling()`
+   не запускается, и процесс обслуживает только uvicorn. Если локальный бот всё ещё
+   крутится с polling, Telegram отдаёт `Conflict: terminated by other getUpdates`,
+   а вебхук не получает обновления — выключите локальный процесс.
+4. `curl -s https://<домен>/health` → `{"status":"ok"}`.
+
+### Логи
+
+```bash
+railway logs        # поток логов запущенного сервиса
+```
+
+Логи — JSON-строки (см. `app/logging_config.py`): по ним проверяются
+`Alembic migrations applied` и `webhook registration OK/FAILED`.
+Примечание: миграции запускаются тем же процессом, что и приложение, поэтому важно,
+чтобы Alembic не отключал уже созданные логгеры (`disable_existing_loggers=False`
+в `alembic/env.py`) — иначе логи после старта пропадают.
+
+### Обновление Apps Script без смены URL
+
+URL `/exec` привязан к **deployment ID**, а не к версии кода. Чтобы обновить скрипт,
+сохранив тот же `GOOGLE_SHEETS_WEBHOOK_URL`:
+
+1. Открыть таблицу → Extensions → Apps Script.
+2. Deploy → **Manage deployments**.
+3. Выбрать активный deployment → карандаш (Edit) → Version: **New version** → Deploy.
+
+URL `/exec` не меняется, править переменные в Railway не нужно. Если вместо этого
+сделать «New deployment», получится **новый** URL — тогда обновите
+`GOOGLE_SHEETS_WEBHOOK_URL` и передеплойте сервис.
+
+### ⚠️ Эфемерная файловая система Railway — риск для SQLite
+
+По умолчанию ФС контейнера **эфемерна**: всё, что записано вне Volume, исчезает при
+каждом редеплое/рестарте. `DATABASE_URL` по умолчанию указывает на `leadforge.db`
+внутри контейнера, значит **после редеплоя пропадут лиды, сессии, `sheet_row`
+и `extraction_logs`**; строки в Google Sheets останутся, но `/undo`, `/resync` и
+дедупликация потеряют состояние (дедуп сравнивает с локальной БД).
+
+Варианты:
+
+**A. Railway Volume (быстро, для небольших объёмов).**
+
+1. Service → Settings → Volumes → New Volume, mount path — например `/data`.
+2. Переменная `DATABASE_URL=sqlite+aiosqlite:////data/leadforge.db`
+   (четыре слэша — это абсолютный путь `/data/leadforge.db`).
+3. Redeploy: `alembic upgrade head` выполнится при старте, БД на Volume переживёт
+   редеплои. `numReplicas` должен остаться `1` — два контейнера на одном файле SQLite
+   приведут к блокировкам.
+
+**B. Postgres (рекомендуется при росте данных).**
+Модель данных уже готова к этому: `owner_user_id` в `leads`, таблицы `users` и
+`audit_log`. Подключите Railway Postgres и задайте
+`DATABASE_URL=postgresql+asyncpg://<user>:<pass>@<host>:<port>/<db>`.
+Драйвера `asyncpg` в `requirements.txt` пока нет — добавьте его. Обратите внимание:
+готовой нормализации `postgres://` → `postgresql+asyncpg://` в конфиге нет, URL нужно
+записать сразу в форме `postgresql+asyncpg://`. SQLite-специфичные PRAGMA
+(`app/database.py`) применяются только когда URL начинается с `sqlite`, поэтому
+Postgres заработает без правок кода.
+
+**C. Осознанный риск.** Оставить SQLite в контейнере и принять, что история лидов
+живёт до следующего деплоя (Google Sheets при этом данные сохраняет). Годится только
+для пилота — при любом редеплое локальное состояние обнуляется.
 
 ## Команды
 

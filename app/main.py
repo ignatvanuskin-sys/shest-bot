@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
@@ -16,7 +17,41 @@ from app.logging_config import setup_logging
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_PORT = 8080
+WEBHOOK_PATH = "/webhook"
+
 _container = None
+
+
+def resolve_port() -> int:
+    """HTTP port for uvicorn. Railway (and most PaaS) inject ``PORT``."""
+    raw = os.environ.get("PORT", "").strip()
+    if not raw:
+        return DEFAULT_PORT
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("invalid PORT=%r — falling back to %s", raw, DEFAULT_PORT)
+        return DEFAULT_PORT
+
+
+def resolve_webhook_url(settings) -> tuple[str, str] | None:
+    """Resolve the webhook URL and where it came from.
+
+    Priority: explicit ``WEBHOOK_URL``, then the public domain Railway injects
+    (``RAILWAY_PUBLIC_DOMAIN``) with the ``/webhook`` path appended. Returns
+    ``None`` when neither is configured.
+    """
+    explicit = (settings.WEBHOOK_URL or "").strip()
+    if explicit:
+        return explicit, "WEBHOOK_URL"
+
+    domain = (settings.RAILWAY_PUBLIC_DOMAIN or "").strip()
+    if not domain:
+        return None
+    if not domain.startswith(("http://", "https://")):
+        domain = f"https://{domain}"
+    return f"{domain.rstrip('/')}{WEBHOOK_PATH}", "RAILWAY_PUBLIC_DOMAIN"
 
 
 def init_app(settings=None):
@@ -35,11 +70,29 @@ async def startup_runtime(container) -> None:
     """Run migrations and register the webhook when in webhook mode."""
     await run_migrations_async()
     settings = container.settings
-    if not settings.DEV_POLLING:
-        if settings.WEBHOOK_URL:
-            await set_webhook(container, settings.WEBHOOK_URL, settings.WEBHOOK_SECRET)
-        else:
-            logger.warning("webhook mode but WEBHOOK_URL is empty — webhook not registered")
+    if settings.DEV_POLLING:
+        logger.info("DEV_POLLING=true — long polling mode, webhook is not registered")
+        return
+
+    resolved = resolve_webhook_url(settings)
+    if resolved is None:
+        logger.warning(
+            "webhook mode but neither WEBHOOK_URL nor RAILWAY_PUBLIC_DOMAIN is set — "
+            "webhook not registered; set WEBHOOK_URL to the public https URL of this service"
+        )
+        return
+
+    webhook_url, source = resolved
+    logger.info("registering webhook at %s (source: %s)", webhook_url, source)
+    try:
+        await set_webhook(container, webhook_url, settings.WEBHOOK_SECRET)
+    except Exception as exc:
+        # Do not crash-loop the container: log loudly and let /health keep serving.
+        logger.error(
+            "webhook registration FAILED for %s (source: %s): %s", webhook_url, source, exc
+        )
+        return
+    logger.info("webhook registration OK: %s (source: %s)", webhook_url, source)
 
 
 @asynccontextmanager
@@ -95,7 +148,9 @@ def main() -> None:
     else:
         import uvicorn
 
-        uvicorn.run("app.main:app", host="0.0.0.0", port=8080)
+        port = resolve_port()
+        logger.info("starting uvicorn on 0.0.0.0:%s", port)
+        uvicorn.run("app.main:app", host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":
