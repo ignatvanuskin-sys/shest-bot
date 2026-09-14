@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 
 from app.bot.dispatcher import feed_update, set_webhook, setup_dispatcher
 from app.config import get_settings
-from app.database import run_migrations
+from app.database import run_migrations_async
 from app.di import build_container
 from app.logging_config import setup_logging
 
@@ -33,7 +33,7 @@ def init_app(settings=None):
 
 async def startup_runtime(container) -> None:
     """Run migrations and register the webhook when in webhook mode."""
-    run_migrations()
+    await run_migrations_async()
     settings = container.settings
     if not settings.DEV_POLLING:
         if settings.WEBHOOK_URL:
@@ -80,7 +80,7 @@ async def webhook(update: dict, request: Request) -> JSONResponse:
 
 async def run_polling() -> None:
     container = init_app()
-    run_migrations()
+    await run_migrations_async()
     logger.info("starting long polling (DEV_POLLING)")
     try:
         await container.dp.start_polling(container.bot, drop_pending_updates=True)

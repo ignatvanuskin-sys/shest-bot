@@ -1,6 +1,7 @@
 """Async SQLAlchemy engine/session factory (SQLite with WAL) + Alembic bootstrap."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -65,3 +66,13 @@ def run_migrations() -> None:
     cfg.set_main_option("script_location", str(base_dir / "alembic"))
     command.upgrade(cfg, "head")
     logger.info("Alembic migrations applied")
+
+
+async def run_migrations_async() -> None:
+    """Run migrations without blocking/breaking the running event loop.
+
+    Alembic drives an async engine and calls ``asyncio.run`` internally, which is
+    illegal from a thread that already owns a live loop. Offloading the blocking
+    call to a worker thread keeps startup working in both polling and webhook mode.
+    """
+    await asyncio.to_thread(run_migrations)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 from logging.config import fileConfig
 
 from alembic import context
@@ -52,8 +53,23 @@ async def run_async_migrations() -> None:
     await connectable.dispose()
 
 
+def _has_running_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
 def run_migrations_online() -> None:
-    asyncio.run(run_async_migrations())
+    if _has_running_loop():
+        # We were called from inside a live event loop (e.g. a sync entrypoint that
+        # blocks the loop thread). asyncio.run() would raise RuntimeError here, so
+        # drive the async migrations from a worker thread instead.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(asyncio.run, run_async_migrations()).result()
+    else:
+        asyncio.run(run_async_migrations())
 
 
 if context.is_offline_mode():
