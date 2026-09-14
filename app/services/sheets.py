@@ -204,10 +204,17 @@ class WebhookSheetsSyncService(BaseSheetsSyncService):
         super().__init__()
         self.webhook_url = webhook_url
         self.webhook_token = webhook_token
-        # text/plain is deliberate: Apps Script /exec answers application/json POSTs
-        # with a 302 redirect to script.googleusercontent.com; a plain-text body
-        # reaches doPost directly so the script can read e.postData.contents.
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0))
+        # Apps Script /exec ALWAYS answers a POST with a 302 redirect to
+        # script.googleusercontent.com/macros/echo?user_content_key=... — the 302
+        # itself carries an empty body, and the real JSON payload is served only by
+        # the redirect target. The Content-Type does not change this: text/plain is
+        # harmless (and keeps the payload readable by doPost via e.postData.contents),
+        # but the client MUST follow the redirect. Otherwise response.json() sees an
+        # empty body, every attempt fails, and the retry loop writes N duplicates.
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            follow_redirects=True,
+        )
 
     @property
     def configured(self) -> bool:

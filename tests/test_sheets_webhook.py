@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 
 from app import models
@@ -52,7 +53,8 @@ async def test_webhook_append_returns_row_and_caches():
     assert row == 9
     assert lead.sheet_row == 9
     call = svc._client.calls[0]
-    # Critical detail: body is sent as text/plain (JSON string), never application/json.
+    # Body is sent as text/plain (JSON string); the script reads e.postData.contents.
+    # This only affects payload delivery — it does not avoid the /exec 302 redirect.
     assert call["headers"]["Content-Type"].startswith("text/plain")
     body = _body(call)
     assert body["token"] == "secret"
@@ -104,6 +106,97 @@ async def test_webhook_invalid_token_raises():
         await svc._request("append", values=["x"] * 27)
 
     assert "invalid token" in str(exc.value)
+
+
+# --- Apps Script /exec redirect handling ---------------------------------------
+#
+# Live behaviour of the deployed script: POST /exec always answers 302 with an
+# empty body and Location: https://script.googleusercontent.com/macros/echo?...;
+# only the redirect target serves the JSON. Content-Type does not matter. If the
+# client does not follow the redirect it parses an empty body, fails, retries,
+# and writes one duplicate row per attempt.
+
+_ECHO_URL = "https://script.googleusercontent.com/macros/echo?user_content_key=abc"
+
+
+def _redirect_handler(requests: list):
+    """302 on /exec (empty body) → 200 JSON on the Location target."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/exec":
+            return httpx.Response(302, headers={"Location": _ECHO_URL}, content=b"")
+        return httpx.Response(200, json={"ok": True, "row": 42})
+
+    return handler
+
+
+def _client_mirroring(svc: WebhookSheetsSyncService, handler) -> httpx.AsyncClient:
+    """Mocked transport, but redirect policy/timeout copied from the service client.
+
+    Copying `follow_redirects` pins the production setting: if it is removed from
+    WebhookSheetsSyncService, this test starts receiving the empty 302 and fails.
+    """
+    return httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        follow_redirects=svc._client.follow_redirects,
+        timeout=svc._client.timeout,
+    )
+
+
+@pytest.mark.asyncio
+async def test_webhook_client_is_configured_to_follow_redirects():
+    svc = WebhookSheetsSyncService("http://example.test/exec", "secret")
+    try:
+        assert svc._client.follow_redirects is True
+    finally:
+        await svc.close()
+
+
+@pytest.mark.asyncio
+async def test_webhook_append_follows_302_redirect_and_returns_row():
+    svc = WebhookSheetsSyncService("http://example.test/exec", "secret")
+    service_client = svc._client
+    requests: list = []
+    client = _client_mirroring(svc, _redirect_handler(requests))
+    svc._client = client
+
+    try:
+        row = await svc._append(["1"] + ["x"] * 26)
+    finally:
+        await client.aclose()
+        await service_client.aclose()
+
+    # The row comes from the JSON served by the redirect target, not from the 302.
+    assert row == 42
+    assert [r.url.path for r in requests] == ["/exec", "/macros/echo"]
+    assert requests[0].method == "POST"
+    assert requests[0].headers["Content-Type"].startswith("text/plain")
+    assert json.loads(requests[0].content.decode("utf-8"))["action"] == "append"
+
+
+@pytest.mark.asyncio
+async def test_webhook_without_redirect_following_fails_on_empty_302():
+    """Negative control: without the fix the empty 302 makes the request fail."""
+    svc = WebhookSheetsSyncService("http://example.test/exec", "secret")
+    service_client = svc._client
+    requests: list = []
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_redirect_handler(requests)),
+        follow_redirects=False,
+    )
+    svc._client = client
+
+    try:
+        with pytest.raises(sheets_mod.SheetsError) as exc:
+            await svc._request("append", values=["1"] + ["x"] * 26)
+    finally:
+        await client.aclose()
+        await service_client.aclose()
+
+    assert "not JSON" in str(exc.value)
+    # Only the first hop happened — the JSON body was never fetched.
+    assert [r.url.path for r in requests] == ["/exec"]
 
 
 def test_backend_selection_priority():
