@@ -13,7 +13,7 @@ from app.services.dedup import DedupService
 from app.services.extraction import ExtractionService
 from app.services.lead_service import LeadService
 from app.services.session_buffer import SessionBufferService
-from app.services.sheets import SheetsSyncService
+from app.services.sheets import build_sheets_service
 
 logger = logging.getLogger(__name__)
 
@@ -32,13 +32,13 @@ class Container:
         self.session_buffer = SessionBufferService(self.settings.COLLECT_TIMEOUT_SECONDS)
         self.leads = LeadService(self.session_factory)
         self.extraction = ExtractionService(
-            self.settings.OPENROUTER_API_KEY, self.session_factory
+            self.settings.OPENROUTER_API_KEY,
+            self.session_factory,
+            primary_model=self.settings.OPENROUTER_MODEL,
+            fallback_model=self.settings.OPENROUTER_FALLBACK_MODEL,
         )
         self.dedup = DedupService(self.session_factory)
-        self.sheets = SheetsSyncService(
-            self.settings.GOOGLE_SHEET_ID,
-            self.settings.GOOGLE_SERVICE_ACCOUNT_JSON,
-        )
+        self.sheets = build_sheets_service(self.settings)
 
     def warn_missing_secrets(self) -> None:
         missing = self.settings.missing_secrets()
@@ -53,6 +53,7 @@ class Container:
     async def close(self) -> None:
         await self.session_buffer.shutdown()
         await self.extraction.close()
+        await self.sheets.close()
         await self.bot.session.close()
         await self.engine.dispose()
 

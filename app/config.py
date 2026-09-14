@@ -27,10 +27,16 @@ class Settings(BaseSettings):
 
     # LLM (OpenRouter)
     OPENROUTER_API_KEY: str = ""
+    OPENROUTER_MODEL: str = "openrouter/free"
+    OPENROUTER_FALLBACK_MODEL: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
-    # Google Sheets
+    # Google Sheets — service-account path (gspread)
     GOOGLE_SERVICE_ACCOUNT_JSON: str = ""  # base64-encoded service account key
     GOOGLE_SHEET_ID: str = ""
+
+    # Google Sheets — Apps Script webhook path (no GCP/billing card required)
+    GOOGLE_SHEETS_WEBHOOK_URL: str = ""
+    GOOGLE_SHEETS_WEBHOOK_TOKEN: str = ""
 
     # Runtime
     DATABASE_URL: str = f"sqlite+aiosqlite:///{(BASE_DIR / 'leadforge.db').as_posix()}"
@@ -61,10 +67,12 @@ class Settings(BaseSettings):
             missing.append("BOT_TOKEN")
         if not self.OPENROUTER_API_KEY:
             missing.append("OPENROUTER_API_KEY")
-        if not self.GOOGLE_SERVICE_ACCOUNT_JSON:
-            missing.append("GOOGLE_SERVICE_ACCOUNT_JSON")
-        if not self.GOOGLE_SHEET_ID:
-            missing.append("GOOGLE_SHEET_ID")
+        sheets_configured = (
+            bool(self.GOOGLE_SERVICE_ACCOUNT_JSON and self.GOOGLE_SHEET_ID)
+            or bool(self.GOOGLE_SHEETS_WEBHOOK_URL)
+        )
+        if not sheets_configured:
+            missing.append("GOOGLE_SHEETS (нет ни сервис-аккаунта, ни webhook-URL)")
         return missing
 
 

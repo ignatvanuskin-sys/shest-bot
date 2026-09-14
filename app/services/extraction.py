@@ -16,15 +16,18 @@ from app.schemas.extraction import ExtractionResult
 
 logger = logging.getLogger(__name__)
 
-PRIMARY_MODEL = "google/gemini-2.0-flash-001"
-FALLBACK_MODEL = "openai/gpt-4o-mini"
+# Default models verified against the live OpenRouter free-tier catalog.
+# They are overridable via OPENROUTER_MODEL / OPENROUTER_FALLBACK_MODEL.
+PRIMARY_MODEL = "openrouter/free"
+FALLBACK_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Approximate pricing (USD per 1 token) for cost estimation in /stats.
+# Approximate pricing (USD per 1 token) for non-:free models, used only as a
+# fallback when the API response does not include ``usage.cost``.
 PRICING: dict[str, dict[str, float]] = {
-    PRIMARY_MODEL: {"in": 0.10 / 1_000_000, "out": 0.40 / 1_000_000},
-    FALLBACK_MODEL: {"in": 0.15 / 1_000_000, "out": 0.60 / 1_000_000},
+    "google/gemini-2.0-flash-001": {"in": 0.10 / 1_000_000, "out": 0.40 / 1_000_000},
+    "openai/gpt-4o-mini": {"in": 0.15 / 1_000_000, "out": 0.60 / 1_000_000},
 }
 
 JSON_SCHEMA = {
@@ -140,9 +143,17 @@ def parse_extraction_content(content: str) -> ExtractionResult:
 
 
 class ExtractionService:
-    def __init__(self, api_key: str, session_factory: async_sessionmaker):
+    def __init__(
+        self,
+        api_key: str,
+        session_factory: async_sessionmaker,
+        primary_model: str = PRIMARY_MODEL,
+        fallback_model: str = FALLBACK_MODEL,
+    ):
         self.api_key = api_key
         self.session_factory = session_factory
+        self.primary_model = primary_model
+        self.fallback_model = fallback_model
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(60.0, connect=10.0),
             headers={
@@ -162,9 +173,9 @@ class ExtractionService:
             raise ExtractionError("OPENROUTER_API_KEY не задан")
 
         attempts: list[tuple[str, str | None]] = [
-            (PRIMARY_MODEL, None),
-            (PRIMARY_MODEL, None),  # one retry on the same provider
-            (FALLBACK_MODEL, None),
+            (self.primary_model, None),
+            (self.primary_model, None),  # one retry on the same provider
+            (self.fallback_model, None),
         ]
         error_note: str | None = None
         last_error: Exception | None = None
@@ -229,7 +240,7 @@ class ExtractionService:
         usage = data.get("usage") or {}
         tokens_in = usage.get("prompt_tokens")
         tokens_out = usage.get("completion_tokens")
-        cost = self._estimate_cost(model, tokens_in, tokens_out)
+        cost = self._estimate_cost(model, tokens_in, tokens_out, usage)
 
         try:
             result = parse_extraction_content(content)
@@ -241,7 +252,22 @@ class ExtractionService:
         return result
 
     @staticmethod
-    def _estimate_cost(model: str, tokens_in: int | None, tokens_out: int | None) -> float | None:
+    def _estimate_cost(
+        model: str,
+        tokens_in: int | None,
+        tokens_out: int | None,
+        usage: dict[str, Any] | None = None,
+    ) -> float | None:
+        # Free models on OpenRouter always cost nothing.
+        if model.endswith(":free"):
+            return 0.0
+        # Prefer the provider-reported cost when present.
+        usage = usage or {}
+        if usage.get("cost") is not None:
+            try:
+                return float(usage["cost"])
+            except (TypeError, ValueError):
+                pass
         if tokens_in is None or tokens_out is None:
             return None
         price = PRICING.get(model)

@@ -10,7 +10,7 @@ Telegram-бот для сбора и структурирования B2B-лид
 
 - Python 3.11+, aiogram 3.x (FSM), FastAPI (webhook-роут)
 - SQLAlchemy (async) + SQLite (WAL), Alembic-миграции
-- OpenRouter (`google/gemini-2.0-flash-001` → fallback `openai/gpt-4o-mini`), httpx
+- OpenRouter (по умолчанию `openrouter/free` → fallback `nvidia/nemotron-3-ultra-550b-a55b:free`), httpx
 - Pydantic v2, phonenumbers (регион KZ), rapidfuzz, gspread + google-auth
 - pytest + pytest-asyncio
 
@@ -52,8 +52,12 @@ tests/                 # pytest
 ```env
 BOT_TOKEN=...                        # токен бота у @BotFather
 OPENROUTER_API_KEY=...               # https://openrouter.ai/keys
-GOOGLE_SERVICE_ACCOUNT_JSON=...      # base64 от JSON-ключа сервис-аккаунта Google
-GOOGLE_SHEET_ID=...                  # id таблицы из URL /d/<ID>/edit
+OPENROUTER_MODEL=                    # пусто = openrouter/free (см. «Модели LLM»)
+OPENROUTER_FALLBACK_MODEL=           # пусто = nvidia/nemotron-3-ultra-550b-a55b:free
+GOOGLE_SERVICE_ACCOUNT_JSON=...      # base64 от JSON-ключа сервис-аккаунта Google (путь A)
+GOOGLE_SHEET_ID=...                  # id таблицы из URL /d/<ID>/edit (путь A)
+GOOGLE_SHEETS_WEBHOOK_URL=...        # URL /exec Apps Script Web App (путь B, без GCP)
+GOOGLE_SHEETS_WEBHOOK_TOKEN=...      # токен из скрипта Apps Script (путь B)
 ALLOWED_USER_IDS=123,456             # через запятую id telegram-пользователей
 DATABASE_URL=sqlite+aiosqlite:///./leadforge.db
 DEV_POLLING=false                    # true — запуск через long polling (локально)
@@ -76,7 +80,35 @@ pip install -r requirements-dev.txt
 1. Зарегистрируйтесь на https://openrouter.ai
 2. https://openrouter.ai/keys → Create Key → скопируйте в `OPENROUTER_API_KEY`.
 
-### 3. Сервис-аккаунт Google и доступ к таблице
+### 2а. Модели LLM
+
+Модели задаются переменными окружения (пустое значение = дефолт из кода):
+
+- `OPENROUTER_MODEL` — основная модель. По умолчанию `openrouter/free`.
+- `OPENROUTER_FALLBACK_MODEL` — запасная модель. По умолчанию `nvidia/nemotron-3-ultra-550b-a55b:free`.
+
+Обе дефолтные модели — бесплатные (`:free`), проверены живыми вызовами OpenRouter с реальным
+системным промптом бота: полный цикл извлечения проходит, `usage.cost = 0`. В
+`extraction_logs.cost_usd_est` для `:free`-моделей всегда пишется `0.0`.
+
+**Лимиты free-tier OpenRouter.** При балансе аккаунта `$0` на бесплатные модели действует лимит
+**50 запросов/день**. После пополнения баланса на **$10** лимит на бесплатные модели вырастает до
+**1000 запросов/день**. Платные модели (например, `openai/gpt-4o-mini`) при нулевом балансе
+считать надёжными нельзя — без пополнения они не пройдут оплату и могут молча не работать, хотя
+каталог и возвращает 200 на запрос списка моделей.
+
+Чтобы сменить модель, укажите её slug из каталога OpenRouter:
+
+```env
+OPENROUTER_MODEL=nex-agi/nex-n2.5-pro:free
+OPENROUTER_FALLBACK_MODEL=liquid/lfm-2.5-2.6b:free
+```
+
+> ⚠️ Не используйте `openai/gpt-4o-mini` и другие платные модели без пополнения баланса —
+> на free-tier аккаунте с `$0` они ненадёжны.
+
+
+### 3. Путь A — сервис-аккаунт Google (нужна карта для GCP)
 
 1. Откройте https://console.cloud.google.com → создайте проект → включите **Google Sheets API**.
 2. **IAM и администрирование → Учётные записи сервисов** → Создать → роль «Редактор» не нужна,
@@ -92,6 +124,35 @@ pip install -r requirements-dev.txt
 5. Откройте целевую Google-таблицу → **Настройки доступа** → выдайте доступ на **email сервис-аккаунта**
    (вида `...@...iam.gserviceaccount.com`) с правами «Редактор».
 6. Создайте в таблице лист с именем **Leads** (первая строка — заголовки). Порядок колонок фиксирован (A–AA).
+
+### 3а. Путь B — Apps Script Web App (без GCP и банковской карты)
+
+Если привязать карту к `console.cloud.google.com` нельзя, сервис-аккаунт недоступен. Вместо него
+используется **Google Apps Script Web App**, привязанный прямо к самой таблице — бесплатно, без GCP.
+
+1. Откройте целевую таблицу → меню **Расширения → Apps Script**.
+2. Вставьте код целиком из [`docs/google_apps_script_webhook.gs`](docs/google_apps_script_webhook.gs).
+3. Задайте константу `TOKEN` в начале скрипта — любой случайный секрет.
+4. **Деплой → Новое развертывание → тип «Веб-приложение»**:
+   - «Выполнять как»: **я**
+   - «Доступ»: **все, у кого есть ссылка**
+5. Скопируйте URL вида `https://script.google.com/macros/s/…/exec` в `GOOGLE_SHEETS_WEBHOOK_URL`,
+   а значение `TOKEN` — в `GOOGLE_SHEETS_WEBHOOK_TOKEN`.
+
+Выбор бэкенда автоматический: задан `GOOGLE_SERVICE_ACCOUNT_JSON` → gspread (путь A); иначе задан
+`GOOGLE_SHEETS_WEBHOOK_URL` → webhook (путь B); иначе синхронизация «не настроена» — лид сохраняется
+в SQLite с `sheet_row=NULL` и досинхронизируется командой `/resync`.
+
+**Безопасность.** `GOOGLE_SHEETS_WEBHOOK_URL` + `GOOGLE_SHEETS_WEBHOOK_TOKEN` — это секрет: кто знает
+оба значения, тот может писать в таблицу. Редактирует таблицу сам скрипт от имени владельца
+(«Выполнять как: я»), поэтому доступ посторонним не выдаётся, а токен — единственный ключ.
+
+**Квоты.** Для личного использования (десятки лидов/день) запас Apps Script огромный; отдельного
+лимита на запись в свою таблицу через Web App для такого объёма не ощущается.
+
+> Примечание: python-клиент шлёт POST с `Content-Type: text/plain` (JSON-строкой), потому что на
+> `application/json` endpoint `/exec` отвечает 302-редиректом на `script.googleusercontent.com`.
+
 
 ### 4. Как узнать свой telegram_id
 
@@ -116,6 +177,12 @@ pip install -r requirements-dev.txt
 
 ```bash
 DEV_POLLING=true .venv/Scripts/python -m app.main
+```
+
+PowerShell-вариант: в `.env` поставьте `DEV_POLLING=true`, затем:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.main
 ```
 
 В этом режиме бот работает через `getUpdates` (polling) — это единственное разрешённое отступление от
@@ -180,6 +247,7 @@ PY
 - оба уровня дедупликации
 - FSM-переходы (буферизация, `/done` раньше таймера, `/cancel`, ручной ввод)
 - запись/обновление строки в Sheets через мок gspread
+- webhook-бэкенд Sheets (Apps Script): append → кэш `sheet_row`, update по кэшу, ретрай на 500, неверный токен, выбор бэкенда по конфигу
 - allowlist: чужой id не получает доступа
 - merge-логика и `/undo`
 
