@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 router = Router(name="leadforge")
 
 FIELD_LABELS = dict(EDIT_FIELDS)
+# Labels for schema fields the keyboard does not offer but callback data can still
+# name (the audit reproduced the edit bug with «Рейтинг» = «нет данных»).
+FIELD_LABELS.update({"rating": "Рейтинг", "reviews_count": "Отзывы", "has_whatsapp": "WhatsApp"})
 
 
 def _uid(message_or_callback) -> int:
@@ -169,7 +172,7 @@ async def cmd_stats(message: Message, container) -> None:
 
 @router.message(Command("undo"))
 async def cmd_undo(message: Message, container) -> None:
-    result = await container.leads.undo_last(_uid(message))
+    result = await container.leads.undo_last(_uid(message), sheets=container.sheets)
     await safe_reply(message, result or "Нечего откатывать.", action="undo")
 
 
@@ -225,6 +228,19 @@ async def on_collecting_text(message: Message, state, container) -> None:
     await flow.append_message(container, _uid(message), _chat(message), state, message.text)
 
 
+# While the LLM is working (15–40 s on free models) the dialog is locked: a second
+# extraction for the same text produced a second card, and «Добавить» under the
+# first card saved the other lead. Such a message is answered, never extracted.
+@router.message(LeadForm.Processing, F.text)
+async def on_processing_text(message: Message) -> None:
+    await safe_reply(
+        message,
+        f"{emoji('collecting')} Уже обрабатываю предыдущее сообщение — подождите пару секунд.",
+        action="already_processing",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 @router.message(LeadForm.Reviewing, F.text)
 async def on_review_text(message: Message) -> None:
     await safe_reply(
@@ -251,11 +267,25 @@ async def on_edit_text(message: Message, state, container) -> None:
         await safe_reply(message, "Сначала выберите поле для исправления.", action="edit_no_field")
         return
     extracted = dict(data.get("extracted") or {})
-    extracted = flow.apply_edit(extracted, field, message.text)
+    try:
+        updated = flow.apply_edit(extracted, field, message.text)
+    except flow.EditValidationError as exc:
+        # Nothing is lost: the field stays selected, the old value is untouched and
+        # the user is told what the schema expects (previously: ValidationError,
+        # no reply at all, dialog stuck in EditingField).
+        label = html_decoration.quote(str(FIELD_LABELS.get(field, field)))
+        await safe_reply(
+            message,
+            f"{emoji('warning')} Для «{label}» {exc.hint}.",
+            action="edit_invalid_value",
+            reply_markup=fields_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
     session_id = data.get("session_id")
-    await state.update_data(extracted=extracted, editing_field=None)
+    await state.update_data(extracted=updated, editing_field=None)
     await flow.show_review(
-        container, _chat(message), state, ExtractionResult.model_validate(extracted), session_id
+        container, _chat(message), state, ExtractionResult.model_validate(updated), session_id
     )
 
 

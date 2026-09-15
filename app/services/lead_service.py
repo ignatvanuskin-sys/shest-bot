@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -22,6 +24,21 @@ FILL_FIELDS = (
     "company_name", "category", "city", "address", "description",
     "rating", "reviews_count", "contact_person", "source", "source_url",
 )
+
+# Audit actions /undo can reverse, and the marker it writes when it did.
+REVERSIBLE_ACTIONS = ("created", "merged")
+REVERSAL_MARKERS = {"created": "deleted", "merged": "restored"}
+# How far back the undo chain looks for an action that is not reversed yet.
+UNDO_SCAN_LIMIT = 100
+
+
+@dataclass(frozen=True)
+class SheetUndo:
+    """What an undo has to mirror into the sheet (done outside the DB transaction)."""
+
+    kind: Literal["clear", "restore"]
+    row: int | None = None
+    lead_id: int | None = None
 
 
 def extracted_to_lead_fields(owner_id: int, data: ExtractionResult) -> dict:
@@ -301,49 +318,146 @@ class LeadService:
         }
 
     # ---------- undo ----------
-    async def undo_last(self, owner_id: int) -> str | None:
-        """Reverse the actor's latest created/merged action. Returns a human description."""
+    async def undo_last(self, owner_id: int, sheets=None) -> str | None:
+        """Reverse the actor's latest not-yet-reversed created/merged action.
+
+        Walks the audit log newest-first and skips entries that already carry a
+        reversal marker, so several undos in a row work (the old query always
+        returned the same oldest row and answered «нечего откатывать»).
+
+        When *sheets* is given the undo is mirrored into the table as well:
+        a reversed creation blanks the lead's row, a reversed merge rewrites it
+        from the audit snapshot. Returns a human description, or None if nothing
+        is left to undo.
+        """
+        message: str | None = None
+        sheet_action: SheetUndo | None = None
         async with self.session_factory() as session:
             result = await session.execute(
                 select(AuditLog)
-                .where(AuditLog.actor_id == owner_id, AuditLog.action.in_(("created", "merged")))
+                .where(AuditLog.actor_id == owner_id, AuditLog.action.in_(REVERSIBLE_ACTIONS))
                 .order_by(AuditLog.id.desc())
-                .limit(1)
+                .limit(UNDO_SCAN_LIMIT)
             )
-            entry = result.scalars().first()
-            if entry is None:
-                return None
-
-            if entry.action == "created":
-                lead = await session.get(Lead, entry.lead_id)
-                if lead is not None and lead.deleted_at is None:
-                    lead.deleted_at = datetime.now(timezone.utc)
-                    session.add(AuditLog(actor_id=owner_id, action="deleted", lead_id=lead.id,
-                                         details=json.dumps({"lead_id": lead.id})))
-                    await session.commit()
-                    return f"Отменено создание лида #{lead.id}"
-                return None
-
-            if entry.action == "merged":
-                try:
-                    details = json.loads(entry.details or "{}")
-                except ValueError:
-                    return None
-                target = await session.get(Lead, entry.lead_id)
-                duplicate_id = details.get("duplicate_lead_id")
-                snapshot = details.get("snapshot") or {}
-                if target is not None:
-                    for key, value in snapshot.items():
-                        if hasattr(target, key):
-                            setattr(target, key, value)
-                    target.last_action = "restored"
-                duplicate = await session.get(Lead, duplicate_id) if duplicate_id else None
-                if duplicate is not None:
-                    duplicate.duplicate_of_id = None
-                    duplicate.deleted_at = None
-                    duplicate.last_action = "restored"
-                session.add(AuditLog(actor_id=owner_id, action="restored", lead_id=entry.lead_id,
-                                     details=json.dumps({"from": "merged", "lead_id": entry.lead_id})))
+            for entry in result.scalars().all():
+                if await self._already_reversed(session, entry):
+                    continue
+                if entry.action == "created":
+                    outcome = await self._undo_created(session, owner_id, entry)
+                else:
+                    outcome = await self._undo_merged(session, owner_id, entry)
+                if outcome is None:
+                    # Nothing reversible here (row gone / already deleted): the next
+                    # older action still can be.
+                    continue
+                message, sheet_action = outcome
                 await session.commit()
-                return f"Отменено объединение лида #{entry.lead_id}"
+                break
+
+        if message is None:
             return None
+        # The sheet is written after the DB session is closed: the network call must
+        # not hold a SQLite connection (and its failure must not undo the undo).
+        note = await self._reflect_undo_in_sheet(sheets, sheet_action)
+        return f"{message}.{note}" if note else message
+
+    async def _already_reversed(self, session, entry: AuditLog) -> bool:
+        """Whether a newer reversal marker for *entry* exists in the audit log."""
+        marker = REVERSAL_MARKERS[entry.action]
+        stmt = (
+            select(AuditLog.id)
+            .where(
+                AuditLog.lead_id == entry.lead_id,
+                AuditLog.action == marker,
+                AuditLog.id > entry.id,
+            )
+            .limit(1)
+        )
+        return await session.scalar(stmt) is not None
+
+    async def _undo_created(self, session, owner_id: int, entry: AuditLog):
+        lead = await session.get(Lead, entry.lead_id) if entry.lead_id else None
+        if lead is None or lead.deleted_at is not None:
+            return None
+        lead.deleted_at = datetime.now(timezone.utc)
+        session.add(
+            AuditLog(
+                actor_id=owner_id,
+                action="deleted",
+                lead_id=lead.id,
+                details=json.dumps({"lead_id": lead.id}),
+            )
+        )
+        log_json(logger, 20, "lead creation undone", lead_id=lead.id, action="undo_created")
+        return (
+            f"Отменено создание лида #{lead.id}",
+            SheetUndo("clear", row=lead.sheet_row, lead_id=lead.id),
+        )
+
+    async def _undo_merged(self, session, owner_id: int, entry: AuditLog):
+        try:
+            details = json.loads(entry.details or "{}")
+        except ValueError:
+            return None
+        target = await session.get(Lead, entry.lead_id) if entry.lead_id else None
+        if target is None:
+            return None
+        duplicate_id = details.get("duplicate_lead_id")
+        snapshot = details.get("snapshot") or {}
+        for key, value in snapshot.items():
+            if hasattr(target, key):
+                setattr(target, key, value)
+        target.last_action = "restored"
+        duplicate = await session.get(Lead, duplicate_id) if duplicate_id else None
+        if duplicate is not None:
+            duplicate.duplicate_of_id = None
+            duplicate.deleted_at = None
+            duplicate.last_action = "restored"
+        session.add(
+            AuditLog(
+                actor_id=owner_id,
+                action="restored",
+                lead_id=target.id,
+                details=json.dumps({"from": "merged", "lead_id": target.id}),
+            )
+        )
+        log_json(logger, 20, "lead merge undone", lead_id=target.id, action="undo_merged")
+        return (
+            f"Отменено объединение лида #{target.id}",
+            SheetUndo("restore", row=target.sheet_row, lead_id=target.id),
+        )
+
+    async def _reflect_undo_in_sheet(self, sheets, sheet_action: SheetUndo | None) -> str | None:
+        """Mirror an undo into the sheet. Returns a user-facing note on failure.
+
+        The database is already the source of truth at this point, so a failing
+        sheet write must never roll the undo back — it is reported instead.
+        """
+        if sheets is None or sheet_action is None:
+            return None
+        if not getattr(sheets, "configured", False):
+            log_json(
+                logger, 30, "undo not mirrored into sheets (not configured)",
+                action="undo_sheet_skipped", lead_id=sheet_action.lead_id,
+            )
+            return None
+        try:
+            if sheet_action.kind == "clear":
+                if not sheet_action.row:
+                    return None
+                if await sheets.clear_row(sheet_action.row):
+                    return None
+                return " Строку в таблице очистить не удалось — повторите /undo."
+            lead = await self.get_lead(sheet_action.lead_id)
+            if lead is None:
+                return None
+            before = lead.sheet_row
+            row = await sheets.sync_lead(lead)
+            if row is None:
+                return " Таблицу обновить не удалось — повторите /undo."
+            if row != before:
+                await self.update_lead(lead.id, sheet_row=row)
+            return None
+        except Exception:
+            logger.exception("failed to mirror undo into sheets")
+            return " Таблицу обновить не удалось (подробности в логах)."

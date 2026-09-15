@@ -108,6 +108,32 @@ async def test_webhook_invalid_token_raises():
     assert "invalid token" in str(exc.value)
 
 
+@pytest.mark.asyncio
+async def test_webhook_clear_row_sends_27_empty_cells_without_appending():
+    """/undo of a creation blanks the line through the same ``update`` action."""
+    svc = WebhookSheetsSyncService("http://example.test/exec", "secret")
+    svc._client = _FakeWebhookClient([_FakeWebhookResponse(200, {"ok": True})])
+
+    cleared = await svc.clear_row(7)
+
+    assert cleared is True
+    assert len(svc._client.calls) == 1, "clearing a line must not append a second one"
+    body = _body(svc._client.calls[0])
+    assert body["token"] == "secret"
+    assert body["action"] == "update"
+    assert body["row"] == 7
+    assert body["values"] == [""] * 27
+
+
+@pytest.mark.asyncio
+async def test_webhook_clear_row_is_a_noop_without_a_row():
+    svc = WebhookSheetsSyncService("http://example.test/exec", "secret")
+    svc._client = _FakeWebhookClient([])
+
+    assert await svc.clear_row(None) is False
+    assert svc._client.calls == []
+
+
 # --- Apps Script /exec redirect handling ---------------------------------------
 #
 # Live behaviour of the deployed script: POST /exec always answers 302 with an

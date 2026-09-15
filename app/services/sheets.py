@@ -154,6 +154,47 @@ class BaseSheetsSyncService:
             log_json(logger, 40, "sheets sync failed after retries", lead_id=lead.id)
             return None
 
+    async def clear_row(self, row: int | None) -> bool:
+        """Blank the 27 cells of a sheet line. Returns True when it went through.
+
+        Deliberately *not* routed through ``sync_lead``/``is_syncable``: /undo of a
+        creation marks the lead deleted, and dead rows must be refused by the normal
+        sync path — yet the line still has to leave the table. The line itself is
+        kept (empty) so lead numbering and the Apps Script append contract are
+        untouched.
+        """
+        if not row:
+            return False
+        if not self.configured:
+            log_json(
+                logger, 30, "sheets clear skipped (not configured)",
+                sheet_row=row, action="sheets_clear",
+            )
+            return False
+
+        values = [""] * COLUMN_COUNT
+        async with self._lock:
+            for attempt in range(1, RETRY_MAX + 1):
+                try:
+                    await self._update(row, values)
+                    log_json(
+                        logger, 20, "sheets row cleared",
+                        sheet_row=row, action="sheets_clear",
+                    )
+                    return True
+                except Exception as exc:  # 429/5xx/network — retry with backoff
+                    log_json(
+                        logger, 30, "sheets clear retry",
+                        sheet_row=row, action="sheets_clear_retry", reason=str(exc),
+                    )
+                    if attempt < RETRY_MAX:
+                        await asyncio.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)))
+            log_json(
+                logger, 40, "sheets clear failed after retries",
+                sheet_row=row, action="sheets_clear",
+            )
+            return False
+
     async def _append(self, values: list) -> int:
         raise NotImplementedError
 

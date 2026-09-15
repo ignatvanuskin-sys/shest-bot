@@ -230,12 +230,34 @@ class ExtractionService:
             await self._log_attempt(model, session_id, None, None, None, latency, False, response.text[:500])
             raise _UnavailableError(f"HTTP {response.status_code}: {response.text[:200]}")
 
-        data = response.json()
+        # A 200 with a non-JSON/empty body (HTML error page, truncated stream,
+        # proxy answer) is a *provider* failure, not a crash: it must join the
+        # normal retry → fallback → manual-entry chain instead of escaping as a
+        # bare ValueError, which left the user with no card and no prompt.
+        try:
+            data = response.json()
+        except ValueError as exc:
+            await self._log_attempt(
+                model, session_id, None, None, None, latency, False, f"non-JSON body: {exc}"
+            )
+            raise _UnavailableError(f"response body is not JSON: {exc}") from exc
+
+        if not isinstance(data, dict):
+            await self._log_attempt(
+                model, session_id, None, None, None, latency, False, "non-object body"
+            )
+            raise _UnavailableError("response body is not a JSON object")
+
         try:
             content = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             await self._log_attempt(model, session_id, None, None, None, latency, False, "empty choices")
             raise _UnavailableError("unexpected response shape") from exc
+
+        if not isinstance(content, str) or not content.strip():
+            # 200 with no completion (``content: null``) — nothing to parse.
+            await self._log_attempt(model, session_id, None, None, None, latency, False, "empty content")
+            raise _UnavailableError("empty completion content")
 
         usage = data.get("usage") or {}
         tokens_in = usage.get("prompt_tokens")

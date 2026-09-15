@@ -87,6 +87,44 @@ async def test_sync_update_uses_cached_row(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_clear_row_blanks_27_cells_and_keeps_the_line(monkeypatch):
+    """``clear_row`` is the /undo path: an explicit update, never ``is_syncable``."""
+    svc = SheetsSyncService("sheetid", "e30=")
+    calls = []
+
+    async def fake_update(row, values):
+        calls.append((row, values))
+
+    monkeypatch.setattr(svc, "_update", fake_update)
+
+    assert await svc.clear_row(7) is True
+    assert calls == [(7, [""] * 27)]
+
+
+@pytest.mark.asyncio
+async def test_clear_row_reports_failure_after_retries(monkeypatch):
+    monkeypatch.setattr(sheets_mod, "RETRY_BASE_DELAY", 0.0)
+    monkeypatch.setattr(sheets_mod, "RETRY_MAX", 3)
+    svc = SheetsSyncService("sheetid", "e30=")
+    attempts = {"n": 0}
+
+    async def flaky(row, values):
+        attempts["n"] += 1
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(svc, "_update", flaky)
+
+    assert await svc.clear_row(7) is False
+    assert attempts["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_clear_row_skips_when_not_configured():
+    svc = SheetsSyncService("", "")
+    assert await svc.clear_row(7) is False
+
+
+@pytest.mark.asyncio
 async def test_sync_retries_then_gives_up(monkeypatch):
     monkeypatch.setattr(sheets_mod, "RETRY_BASE_DELAY", 0.0)
     monkeypatch.setattr(sheets_mod, "RETRY_MAX", 3)
