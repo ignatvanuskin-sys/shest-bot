@@ -40,6 +40,9 @@ class Container:
             self.session_factory,
             primary_model=self.settings.OPENROUTER_MODEL,
             fallback_model=self.settings.OPENROUTER_FALLBACK_MODEL,
+            # ТЗ §11: full bodies are stored in the DB (truncated, purged by the
+            # retention worker) unless the owner switches them off.
+            log_bodies=bool(getattr(self.settings, "LOG_LLM_BODIES", True)),
         )
         self.dedup = DedupService(
             self.session_factory,

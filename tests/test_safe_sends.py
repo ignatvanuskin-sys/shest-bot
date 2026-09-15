@@ -46,6 +46,7 @@ from tests.integration_harness import (
     assert_valid_telegram_html,
     harness,  # noqa: F401  — imported fixture
     no_network,  # noqa: F401  — autouse imported fixture (blocks non-loopback sockets)
+    wait_until,
 )
 
 # ---------------- helpers ----------------
@@ -510,7 +511,13 @@ async def test_add_lead_still_saves_when_the_confirmation_send_fails(harness, mo
     break_method(monkeypatch, harness.bot, "send_message", forbidden_error())
 
     with caplog.at_level(logging.ERROR):
+        # FIX-24: the confirmation is sent by the tracked sync job (the first moment
+        # both the ID and the row number are known), so the *update* stays successful
+        # and the failed send is reported by that job — still never a 500.
         result = await harness.tap(CB_ADD)
+        assert await wait_until(lambda: "lead_added" in actions(caplog)), (
+            "the failed confirmation was not reported"
+        )
 
     assert result is not UNHANDLED
     leads = await harness.leads()

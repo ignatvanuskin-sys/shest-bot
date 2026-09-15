@@ -125,6 +125,10 @@ class ExtractionLog(Base):
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     success: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ТЗ §11: the model's answer itself, truncated (see MAX_RESPONSE_BODY_CHARS).
+    # DEBUG-level data: written only when LOG_LLM_BODIES is on, and purged after
+    # EXTRACTION_LOG_RETENTION_DAYS. Never written to the stdout logs.
+    response_body: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), nullable=False)
 
 

@@ -61,7 +61,9 @@ async def _add_first_lead(harness) -> int:
     await harness.send_command("/done")
     await harness.tap(CB_ADD)
 
-    assert await wait_until(lambda: len(harness.sheets.appends) == 1)
+    # The next sync must *update* this row, so wait for the cached row number — an
+    # append is recorded before that database write (see the harness helper).
+    await harness.wait_for_sheet_row(1)
     leads = await harness.leads()
     assert len(leads) == 1
     assert leads[0].sheet_row == harness.sheets.row, "the row must be cached → next sync updates"

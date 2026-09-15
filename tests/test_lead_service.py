@@ -78,6 +78,9 @@ async def test_undo_merge_restores(session_factory):
     db = await svc.get_lead(existing.id)
     assert db.website is None  # restored from snapshot
 
+    # FIX-21: the duplicate is *not* resurrected — it stays archived history, so no
+    # living lead without a sheet row (and no spare table line) appears.
     restored = await svc.get_lead(merged.id)
-    assert restored.deleted_at is None
-    assert restored.duplicate_of_id is None
+    assert restored.deleted_at is not None
+    assert restored.duplicate_of_id == existing.id
+    assert restored.last_action == "merge_undone"

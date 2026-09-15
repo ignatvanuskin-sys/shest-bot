@@ -44,6 +44,20 @@ FIELD_LABELS = dict(EDIT_FIELDS)
 # name (the audit reproduced the edit bug with «Рейтинг» = «нет данных»).
 FIELD_LABELS.update({"rating": "Рейтинг", "reviews_count": "Отзывы", "has_whatsapp": "WhatsApp"})
 
+# Fallbacks for the two list limits when a settings object does not carry them
+# (values mirror app.config.Settings, which always provides them in production).
+DEFAULT_LAST_LEADS_LIMIT = 5
+DEFAULT_SEARCH_RESULT_LIMIT = 20
+
+
+def _int_setting(settings, name: str, default: int) -> int:
+    """A positive int setting, falling back to the documented default."""
+    try:
+        value = int(getattr(settings, name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
 
 def _uid(message_or_callback) -> int:
     return message_or_callback.from_user.id
@@ -120,7 +134,9 @@ async def cmd_cancel(message: Message, state, container) -> None:
 
 @router.message(Command("last"))
 async def cmd_last(message: Message, container) -> None:
-    leads = await container.leads.get_last_leads(_uid(message), limit=5)
+    # FIX-25c: the number of leads is configuration, not a literal buried in a handler.
+    limit = _int_setting(container.settings, "LAST_LEADS_LIMIT", DEFAULT_LAST_LEADS_LIMIT)
+    leads = await container.leads.get_last_leads(_uid(message), limit=limit)
     if not leads:
         await safe_reply(message, "Пока нет добавленных лидов.", action="last_empty")
         return
@@ -144,7 +160,11 @@ async def cmd_search(message: Message, container, command: CommandObject) -> Non
             parse_mode=ParseMode.HTML,
         )
         return
-    leads = await container.leads.search_leads(_uid(message), query)
+    # FIX-25b: a bounded, newest-first result set (SEARCH_RESULT_LIMIT, default 20).
+    limit = _int_setting(
+        container.settings, "SEARCH_RESULT_LIMIT", DEFAULT_SEARCH_RESULT_LIMIT
+    )
+    leads = await container.leads.search_leads(_uid(message), query, limit=limit)
     if not leads:
         await safe_reply(message, "Ничего не найдено.", action="search_empty")
         return
@@ -332,10 +352,15 @@ async def cb_add(callback: CallbackQuery, state, container) -> None:
 
 
 @router.callback_query(F.data == CB_EDIT)
-async def cb_edit(callback: CallbackQuery, state) -> None:
+async def cb_edit(callback: CallbackQuery, state, container) -> None:
     await safe_answer_callback(callback, action="ack_edit")
     await state.set_state(LeadForm.EditingField)
     await state.update_data(editing_field=None)
+    # FIX-25a: the dialog is no longer «just showing a card» — the database says so.
+    data = await state.get_data()
+    await flow.set_session_status(
+        container, data.get("session_id"), flow.SESSION_STATUS_EDITING
+    )
     await _answer_via_callback(
         callback,
         f"{emoji('pencil')} Какое поле исправить?",

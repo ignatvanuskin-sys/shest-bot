@@ -151,7 +151,9 @@ async def test_one_session_id_spans_llm_dedup_and_the_sheets_task(harness, captu
     await harness.send_text("ТОО Ромашка, Алматы, +7 700 123 45 67")
     await harness.send_command("/done")
     await harness.tap("add")
-    assert await wait_until(lambda: len(harness.sheets.appends) == 1)
+    # The merge must *update* row 1, so wait for the cached row number, not just the
+    # append (the row number is committed a moment later — see harness helper).
+    assert await harness.wait_for_sheet_row(1) == harness.sheets.row
 
     # Lead #2: same company again → strong match → dedup decision → merge → sheet update.
     harness.extraction._results = [full_result()]
@@ -191,7 +193,7 @@ async def test_the_sheets_task_inherits_the_context_of_the_user_action(harness, 
     await harness.send_command("/done")
 
     await harness.tap("add")
-    assert await wait_until(lambda: len(harness.sheets.appends) == 1)
+    assert await harness.wait_for_sheet_row(1) == harness.sheets.row
 
     session_ids = [str(session.id) for session in await harness.sessions()]
     assert captured_sessions.messages("sheets sync ok") == session_ids

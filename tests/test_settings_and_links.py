@@ -6,6 +6,10 @@ Both were «text that does not match the configuration»:
   включены» whatever the config said;
 * after a successful save the bot wrote «Строка N» with no way to open the table.
 
+FIX-24 later merged the two post-save messages («ID #N» + «строка M») into one, so
+the link now arrives on that single confirmation — the assertions below check both
+the link and the "one message, not two" rule.
+
 These go through the real dispatcher, so the HTML that reaches Telegram is checked as
 well (a link with an unescaped ``&`` would be a 400, not a cosmetic bug).
 """
@@ -84,9 +88,11 @@ async def test_added_lead_message_carries_the_sheet_link(harness, monkeypatch):
     await harness.send_command("/done")
     await harness.tap(CB_ADD)
 
-    assert await wait_until(lambda: harness.bot.contains(f"Строка #{harness.sheets.row}"))
-    ready = [call for call in harness.bot.messages() if "Строка #" in (call.text or "")]
-    assert ready, "the sync message was not sent"
+    # FIX-24: one message, and it is the one that carries both facts + the link.
+    expected = f"Лид добавлен — ID #1, строка {harness.sheets.row}"
+    assert await wait_until(lambda: harness.bot.contains(expected))
+    ready = [call for call in harness.bot.messages() if expected in (call.text or "")]
+    assert len(ready) == 1, "the confirmation must be a single message"
     assert f'<a href="{SHEET_URL}">' in ready[-1].text
     assert_valid_telegram_html(ready[-1].text)
 
@@ -98,8 +104,10 @@ async def test_added_lead_message_has_no_link_without_configuration(harness):
     await harness.send_command("/done")
     await harness.tap(CB_ADD)
 
-    assert await wait_until(lambda: harness.bot.contains(f"Строка #{harness.sheets.row}"))
-    ready = [call for call in harness.bot.messages() if "Строка #" in (call.text or "")]
+    expected = f"Лид добавлен — ID #1, строка {harness.sheets.row}"
+    assert await wait_until(lambda: harness.bot.contains(expected))
+    ready = [call for call in harness.bot.messages() if expected in (call.text or "")]
+    assert len(ready) == 1, "the confirmation must be a single message"
     assert "<a href=" not in ready[-1].text, "no link may appear when none is configured"
 
 

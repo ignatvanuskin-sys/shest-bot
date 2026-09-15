@@ -178,12 +178,21 @@ async def test_happy_path_add_lead_and_sync_to_sheets(harness):
     assert lead.company_name == "Ромашка"
     assert lead.phone == "+77001234567"
     assert lead.instagram == "romashka"
-    assert harness.bot.contains(f"Лид добавлен — ID #{lead.id}")
 
-    # Sheet sync runs as a background task; wait for it instead of racing.
-    assert await wait_until(lambda: len(harness.sheets.synced) == 1)
+    # The sheet sync runs as a background task and the confirmation is sent *by* it,
+    # so that ID and row arrive in one message (FIX-24) — wait for it, don't race.
+    assert await wait_until(
+        lambda: harness.bot.contains(
+            f"Лид добавлен — ID #{lead.id}, строка {harness.sheets.row}"
+        )
+    ), f"combined confirmation missing: {harness.bot.texts()}"
     assert harness.sheets.synced[0].id == lead.id
-    assert await wait_until(lambda: harness.bot.contains(f"Строка #{harness.sheets.row}"))
+
+    added = [text for text in harness.bot.texts() if "Лид добавлен" in text]
+    assert len(added) == 1, f"the save must be confirmed exactly once: {added}"
+    assert not any("Строка #" in text for text in harness.bot.texts()), (
+        "the old second message («Строка N») is back"
+    )
 
     refreshed = (await harness.leads())[0]
     assert refreshed.sheet_row == harness.sheets.row
@@ -281,9 +290,15 @@ async def test_resync_pushes_unsynced_leads(harness):
     await harness.send_command("/done")
     await harness.tap(CB_ADD)
 
-    assert await wait_until(lambda: len(harness.sheets.synced) == 1)
+    # The background job first reports the save (the row could not be written), so
+    # wait for that message instead of racing the sync call.
+    assert await wait_until(lambda: harness.bot.contains("Лид добавлен"))
+    assert len(harness.sheets.synced) == 1
     assert (await harness.leads())[0].sheet_row is None
-    assert harness.bot.contains("синхронизация с таблицей чуть задержится")
+    assert harness.bot.contains("Синхронизация с таблицей чуть задержится")
+    # FIX-24: even when the row could not be written the save is confirmed **once**.
+    added = [text for text in harness.bot.texts() if "Лид добавлен" in text]
+    assert len(added) == 1 and "ID #1" in added[0]
 
     harness.sheets.row = 42
     await harness.send_command("/resync")

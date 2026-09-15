@@ -29,6 +29,27 @@ OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 # which is why the reported value wins over this predicate (FIX-11).
 FREE_MODEL_SUFFIXES = (":free", "/free")
 
+# ТЗ §11: the full answer of the model is DEBUG-level data. It goes into
+# ``extraction_logs.response_body`` (never into the stdout logs — a JSON log line
+# carrying a 4 kB answer is unreadable and would be shipped off the box) and is
+# capped here so one runaway completion cannot bloat the database. The ellipsis
+# marks a truncated body, so a reader never mistakes it for the whole answer.
+MAX_RESPONSE_BODY_CHARS = 4000
+TRUNCATION_MARK = "…"
+
+
+def truncate_response_body(value: str | None, limit: int = MAX_RESPONSE_BODY_CHARS) -> str | None:
+    """Cap a response body at *limit* characters (``None`` stays ``None``).
+
+    The marker is counted *inside* the limit, so the stored value never exceeds it.
+    """
+    if value is None:
+        return None
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - 1, 0)] + TRUNCATION_MARK
+
 
 def is_free_model(model: str | None) -> bool:
     """Whether *model* names a free OpenRouter model (suffix or router alias)."""
@@ -161,11 +182,14 @@ class ExtractionService:
         session_factory: async_sessionmaker,
         primary_model: str = PRIMARY_MODEL,
         fallback_model: str = FALLBACK_MODEL,
+        log_bodies: bool = True,
     ):
         self.api_key = api_key
         self.session_factory = session_factory
         self.primary_model = primary_model
         self.fallback_model = fallback_model
+        # ТЗ §11: full response bodies are persisted (truncated) unless switched off.
+        self.log_bodies = log_bodies
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(60.0, connect=10.0),
             headers={
@@ -237,9 +261,16 @@ class ExtractionService:
             raise _UnavailableError(f"network error: {exc}") from exc
 
         latency = int((time.perf_counter() - started) * 1000)
+        # The raw wire body, kept for the DB log (truncated inside ``_log_attempt``).
+        # ``response.text`` on a missing/empty body is "" — an empty string truthfully
+        # says "the provider sent nothing", which ``None`` would hide.
+        raw_body = response.text
 
         if response.status_code >= 400:
-            await self._log_attempt(model, session_id, None, None, None, latency, False, response.text[:500])
+            await self._log_attempt(
+                model, session_id, None, None, None, latency, False,
+                response.text[:500], response_body=raw_body,
+            )
             raise _UnavailableError(f"HTTP {response.status_code}: {response.text[:200]}")
 
         # A 200 with a non-JSON/empty body (HTML error page, truncated stream,
@@ -250,25 +281,33 @@ class ExtractionService:
             data = response.json()
         except ValueError as exc:
             await self._log_attempt(
-                model, session_id, None, None, None, latency, False, f"non-JSON body: {exc}"
+                model, session_id, None, None, None, latency, False,
+                f"non-JSON body: {exc}", response_body=raw_body,
             )
             raise _UnavailableError(f"response body is not JSON: {exc}") from exc
 
         if not isinstance(data, dict):
             await self._log_attempt(
-                model, session_id, None, None, None, latency, False, "non-object body"
+                model, session_id, None, None, None, latency, False, "non-object body",
+                response_body=raw_body,
             )
             raise _UnavailableError("response body is not a JSON object")
 
         try:
             content = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
-            await self._log_attempt(model, session_id, None, None, None, latency, False, "empty choices")
+            await self._log_attempt(
+                model, session_id, None, None, None, latency, False, "empty choices",
+                response_body=raw_body,
+            )
             raise _UnavailableError("unexpected response shape") from exc
 
         if not isinstance(content, str) or not content.strip():
             # 200 with no completion (``content: null``) — nothing to parse.
-            await self._log_attempt(model, session_id, None, None, None, latency, False, "empty content")
+            await self._log_attempt(
+                model, session_id, None, None, None, latency, False, "empty content",
+                response_body=raw_body,
+            )
             raise _UnavailableError("empty completion content")
 
         usage = data.get("usage") or {}
@@ -279,10 +318,16 @@ class ExtractionService:
         try:
             result = parse_extraction_content(content)
         except _InvalidJsonError as exc:
-            await self._log_attempt(model, session_id, tokens_in, tokens_out, cost, latency, False, str(exc))
+            await self._log_attempt(
+                model, session_id, tokens_in, tokens_out, cost, latency, False, str(exc),
+                response_body=content,
+            )
             raise
 
-        await self._log_attempt(model, session_id, tokens_in, tokens_out, cost, latency, True, None)
+        await self._log_attempt(
+            model, session_id, tokens_in, tokens_out, cost, latency, True, None,
+            response_body=content,
+        )
         return result
 
     @staticmethod
@@ -323,11 +368,19 @@ class ExtractionService:
         latency_ms: int | None,
         success: bool,
         error: str | None,
+        response_body: str | None = None,
     ) -> None:
+        # NOTE: the body deliberately does *not* appear in this log line — only its
+        # length does (ТЗ §11: bodies are DEBUG data that lives in the database).
         log_json(
             logger, 20, "llm attempt",
             session_id=session_id, model=model, tokens_in=tokens_in, tokens_out=tokens_out,
             cost_usd_est=cost, latency_ms=latency_ms, success=success,
+            response_body_chars=len(response_body) if response_body is not None else None,
+        )
+        stored_body = (
+            truncate_response_body(response_body) if (self.log_bodies and response_body is not None)
+            else None
         )
         try:
             async with self.session_factory() as session:
@@ -341,6 +394,7 @@ class ExtractionService:
                         latency_ms=latency_ms,
                         success=success,
                         error=error,
+                        response_body=stored_body,
                     )
                 )
                 await session.commit()

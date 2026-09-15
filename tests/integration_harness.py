@@ -396,6 +396,27 @@ class DispatcherHarness:
             result = await session.execute(select(Lead).order_by(Lead.id))
             return list(result.scalars().all())
 
+    async def wait_for_sheet_row(self, lead_id: int, *, timeout: float = 5.0) -> int:
+        """Wait until the background sync of *lead_id* committed its row number.
+
+        ``sheets.appends`` becomes visible when the backend is called, a moment
+        before ``sheet_row`` is written to the database — so waiting for an append
+        is a race, and the next action (another sync, an /undo, a merge) may then run
+        without the cached row. The confirmation message is not a reliable signal
+        either (the merge path sends a different one), hence the direct read.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        row: int | None = None
+        while loop.time() < deadline:
+            async with self.container.session_factory() as session:
+                lead = await session.get(Lead, lead_id)
+            row = lead.sheet_row if lead is not None else None
+            if row:
+                return row
+            await asyncio.sleep(0.01)
+        raise AssertionError(f"lead #{lead_id} never got a sheet row (sheet_row={row})")
+
     async def lead_count(self) -> int:
         return len(await self.leads())
 

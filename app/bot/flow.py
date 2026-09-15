@@ -19,6 +19,11 @@ from app.models import Lead
 from app.schemas.extraction import ExtractionResult
 from app.services.dedup import fingerprint_from_extraction
 from app.services.extraction import ExtractionError
+from app.services.lead_service import (
+    SESSION_STATUS_CANCELLED,
+    SESSION_STATUS_EDITING,
+    SESSION_STATUS_REVIEW,
+)
 from app.services.normalize import normalize_phone, normalize_social_handle, normalize_website
 
 logger = logging.getLogger(__name__)
@@ -138,7 +143,7 @@ async def cancel_collection(
     session_id = data.get("session_id")
     bind_session_id(session_id)
     if session_id:
-        await container.leads.update_session(session_id, status="cancelled")
+        await container.leads.update_session(session_id, status=SESSION_STATUS_CANCELLED)
     await state.clear()
     if not silent and chat_id is not None:
         await notify(
@@ -217,7 +222,7 @@ async def _finalize_collection(container, user_id: int, chat_id: int, state: FSM
     bind_session_id(session_id)
     try:
         await container.leads.update_session(
-            session_id, combined_text=combined, status="review",
+            session_id, combined_text=combined, status=SESSION_STATUS_REVIEW,
             last_message_at=datetime.now(timezone.utc),
         )
         await notify(
@@ -264,7 +269,7 @@ async def _finalize_collection(container, user_id: int, chat_id: int, state: FSM
         if not await _still_processing(state):
             return
 
-        await container.leads.update_session(session_id, status="review")
+        await container.leads.update_session(session_id, status=SESSION_STATUS_REVIEW)
 
         if extracted.is_empty():
             await cancel_collection(container, user_id, state, silent=True)
@@ -330,12 +335,29 @@ async def _finalize_collection(container, user_id: int, chat_id: int, state: FSM
         set_session_id(previous_session_id)
 
 
+async def set_session_status(container, session_id: int | None, status: str) -> None:
+    """Write ``lead_sessions.status`` for the current dialog (FIX-25a).
+
+    The status column is what the database says about a dialog when nobody is
+    watching the process, so it has to follow every stage instead of staying at
+    ``collecting``/``review``: ``editing`` is written while «Исправить» is open, and
+    ``review`` again as soon as a card is rendered. No session (e.g. an FSM state
+    that lost its data) → nothing to update.
+    """
+    if session_id is None:
+        return
+    await container.leads.update_session(session_id, status=status)
+
+
 async def show_review(
     container, chat_id: int, state: FSMContext, extracted: ExtractionResult, session_id: int
 ) -> None:
     bind_session_id(session_id)
     await state.set_state(LeadForm.Reviewing)
     await state.update_data(extracted=extracted.model_dump(), session_id=session_id)
+    # A card is on screen ⇔ the dialog is waiting for a decision («review»), which
+    # also takes it back out of «editing» after a correction.
+    await set_session_status(container, session_id, SESSION_STATUS_REVIEW)
     await notify(
         container,
         chat_id,
@@ -364,16 +386,10 @@ async def confirm_add(container, user_id: int, chat_id: int, state: FSMContext) 
         )
         return
     lead = await container.leads.add_lead(user_id, extracted, session_id)
-    spawn_sync(container, lead.id, chat_id)
+    # FIX-24: one message, not two. The reply is sent by the sync job, which is the
+    # first moment both facts exist («ID #N» and «строка M») — see sync_and_notify.
+    spawn_sync(container, lead.id, chat_id, notice=lead_added_notice(lead.id))
     await state.clear()
-    await notify(
-        container,
-        chat_id,
-        f"{emoji('check')} Лид добавлен — ID #{lead.id}.",
-        action="lead_added",
-        user_id=user_id,
-        parse_mode=ParseMode.HTML,
-    )
 
 
 async def handle_duplicate_choice(
@@ -389,16 +405,8 @@ async def handle_duplicate_choice(
 
     if choice == "new":
         lead = await container.leads.add_lead(user_id, extracted, session_id)
-        spawn_sync(container, lead.id, chat_id)
+        spawn_sync(container, lead.id, chat_id, notice=lead_added_notice(lead.id))
         await state.clear()
-        await notify(
-            container,
-            chat_id,
-            f"{emoji('check')} Лид добавлен — ID #{lead.id}.",
-            action="lead_added_duplicate_new",
-            user_id=user_id,
-            parse_mode=ParseMode.HTML,
-        )
         return
 
     prefer_new_contact = choice == "contact"
@@ -542,44 +550,76 @@ def merge_sync_target(lead: Lead) -> int:
     return lead.duplicate_of_id or lead.id
 
 
-def spawn_sync(container, lead_id: int, chat_id: int) -> None:
+def lead_added_notice(lead_id: int) -> str:
+    """Opening of the single «лид добавлен» message (FIX-24).
+
+    The row number only exists once the sheet write is done, so the sentence is
+    completed by the sync job: «✅ Лид добавлен — ID #7, строка 12».
+    """
+    return f"{emoji('check')} Лид добавлен — ID #{lead_id}"
+
+
+def spawn_sync(container, lead_id: int, chat_id: int, notice: str | None = None) -> None:
     """Queue the background sheet sync for *lead_id*.
 
     Goes through the container's task registry instead of a bare
     ``asyncio.create_task``: the reference is kept until the job finishes (a task the
     loop only sees through a local variable can be collected mid-flight), failures are
     visible, and graceful shutdown drains it instead of dropping the sync.
+
+    *notice* is the «лид добавлен» half of the confirmation the job will send; without
+    it the job only reports the row when it becomes ready (merge paths, where the
+    «обновлён лид #N» message was already sent by the caller).
     """
     container.tasks.spawn(
-        sync_and_notify(container, lead_id, chat_id), name=f"sheets-sync-{lead_id}"
+        sync_and_notify(container, lead_id, chat_id, notice=notice),
+        name=f"sheets-sync-{lead_id}",
     )
 
 
-async def sync_and_notify(container, lead_id: int, chat_id: int) -> None:
-    """Background: sync to Sheets and notify about the result. Never blocks the flow."""
+async def sync_and_notify(container, lead_id: int, chat_id: int, notice: str | None = None) -> None:
+    """Background: sync to Sheets and notify about the result. Never blocks the flow.
+
+    The sync stays off the request path on purpose: the webhook awaits the update
+    handler, and a slow/hanging Sheets API would delay the HTTP 200 until Telegram
+    re-delivers the update (a replayed «Добавить» would save the lead twice).
+    """
     try:
         lead = await container.leads.get_lead(lead_id)
         if lead is None:
             return
         row = await container.sheets.sync_lead(lead)
+        # FIX-15: link straight to the table when one is configured.
+        link = sheet_link_html(container.settings)
         if row:
             await container.leads.update_lead(lead_id, sheet_row=row)
-            # FIX-15: link straight to the table when one is configured.
-            link = sheet_link_html(container.settings)
+            if notice:
+                # FIX-24: the ID and the row in one message, never two.
+                text = f"{notice}, строка {row}."
+            else:
+                text = f"{emoji('row')} Строка #{row} в таблице готова."
             await notify(
                 container,
                 chat_id,
-                f"{emoji('row')} Строка #{row} в таблице готова."
-                + (f" {link}" if link else ""),
-                action="sync_row_ready",
+                text + (f" {link}" if link else ""),
+                action="lead_added" if notice else "sync_row_ready",
                 parse_mode=ParseMode.HTML,
             )
         else:
+            if notice:
+                text = (
+                    f"{notice}. Синхронизация с таблицей чуть задержится — "
+                    "позже выполните /resync."
+                )
+            else:
+                text = (
+                    f"{emoji('check')} Добавлено в базу, синхронизация с таблицей чуть "
+                    "задержится. Позже выполните /resync."
+                )
             await notify(
                 container,
                 chat_id,
-                f"{emoji('check')} Добавлено в базу, синхронизация с таблицей чуть "
-                "задержится. Позже выполните /resync.",
+                text,
                 action="sync_deferred",
                 parse_mode=ParseMode.HTML,
             )

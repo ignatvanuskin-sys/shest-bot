@@ -68,6 +68,19 @@ class Settings(BaseSettings):
     # DedupService). Bounds the in-memory comparison for a large base.
     DEDUP_CANDIDATE_LIMIT: int = 500
 
+    # ТЗ §11: full LLM response bodies are stored — but only in the database
+    # (``extraction_logs.response_body``, truncated), never in the stdout logs.
+    LOG_LLM_BODIES: bool = True
+    # …and not for ever: rows older than this are deleted by a daily background
+    # pass. 0 or less switches the cleanup off (bodies are then kept indefinitely).
+    EXTRACTION_LOG_RETENTION_DAYS: int = 30
+    # Seconds between retention passes (default: once a day). 0 or less = off.
+    EXTRACTION_LOG_CLEANUP_INTERVAL_SECONDS: float = 86400.0
+
+    # How many hits /search returns (newest first) and how many leads /last lists.
+    SEARCH_RESULT_LIMIT: int = 20
+    LAST_LEADS_LIMIT: int = 5
+
     @property
     def allowed_user_ids(self) -> set[int]:
         """Parsed allowlist as a set of ints."""

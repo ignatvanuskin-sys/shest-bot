@@ -55,17 +55,57 @@ def unwrap_user_event(event: TelegramObject) -> TelegramObject | None:
 
 
 def is_allowed(allowed_user_ids: set[int], user_id: int) -> bool:
-    """Allowlist decision (also a testable seam)."""
+    """Allowlist decision for the env source (also a testable seam)."""
     return user_id in allowed_user_ids
 
 
+# Where an admission came from — reported in the log so «why does this user have
+# access?» is answerable from the JSON lines alone (FIX-23).
+ALLOW_SOURCE_ENV = "env"
+ALLOW_SOURCE_USERS_TABLE = "users_table"
+
+
 class AllowlistMiddleware(BaseMiddleware):
-    """Blocks unknown users with a single neutral reply; logs their telegram_id."""
+    """Blocks unknown users with a single neutral reply; logs their telegram_id.
+
+    Access is granted when the id is in ``ALLOWED_USER_IDS`` *or* in the ``users``
+    table (FIX-23). The ``users`` table used to be written by nothing and read by
+    nothing; now adding a row is a second, persistent source of access — and the
+    source that admitted a user is logged once per process.
+    """
 
     def __init__(self, container):
         super().__init__()
         self._container = container
         self._warned: set[int] = set()
+        # user_id → the source they were admitted by, so one busy user does not
+        # produce one INFO line per update (the log stays readable).
+        self._admitted: dict[int, str] = {}
+
+    async def _allow_source(self, user_id: int) -> str | None:
+        """``"env"``, ``"users_table"``, or None when access is denied."""
+        if is_allowed(self._container.settings.allowed_user_ids, user_id):
+            return ALLOW_SOURCE_ENV
+        try:
+            leads = getattr(self._container, "leads", None)
+            lookup = getattr(leads, "is_allowed_user", None)
+            if lookup is not None and await lookup(user_id):
+                return ALLOW_SOURCE_USERS_TABLE
+        except Exception:
+            # A broken lookup (DB locked/not migrated yet) must not grant access —
+            # and must not turn every update into a 500 either. The env allowlist
+            # above stays the primary, always-working source.
+            logger.exception("allowlist lookup in the users table failed")
+        return None
+
+    def _log_admission(self, user_id: int, source: str) -> None:
+        if self._admitted.get(user_id) == source:
+            return
+        self._admitted[user_id] = source
+        log_json(
+            logger, 20, "access allowed",
+            telegram_user_id=user_id, action="allowlist_allowed", source=source,
+        )
 
     async def __call__(self, handler, event, data):
         user_event = unwrap_user_event(event)
@@ -73,16 +113,20 @@ class AllowlistMiddleware(BaseMiddleware):
         if user_id is None:
             return await handler(event, data)
 
-        if is_allowed(self._container.settings.allowed_user_ids, user_id):
+        source = await self._allow_source(user_id)
+        if source is not None:
+            self._log_admission(user_id, source)
             return await handler(event, data)
 
         if user_id not in self._warned:
             self._warned.add(user_id)
             if not self._container.settings.allowed_user_ids:
-                # Empty allowlist → log with an explicit mark so the owner can grab the id.
+                # Empty env allowlist → log with an explicit mark so the owner can grab
+                # the id (the users table was consulted and did not know it either).
                 log_json(
                     logger, 30,
-                    "blocked: allowlist empty, add this id to ALLOWED_USER_IDS",
+                    "blocked: allowlist empty, add this id to ALLOWED_USER_IDS "
+                    "or insert it into the users table",
                     telegram_user_id=user_id, action="allowlist_empty",
                 )
             else:

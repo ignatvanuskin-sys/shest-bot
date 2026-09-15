@@ -82,7 +82,7 @@ def assert_schema_created(db_path) -> None:
         versions = conn.execute("SELECT version_num FROM alembic_version").fetchall()
     finally:
         conn.close()
-    assert [row[0] for row in versions] == ["0002"], "migrations must reach the head revision"
+    assert [row[0] for row in versions] == ["0003"], "migrations must reach the head revision"
 
 
 async def test_run_migrations_async_inside_running_loop(tmp_database_url):
@@ -179,3 +179,50 @@ async def test_migrations_do_not_disable_app_loggers(tmp_database_url):
 
     assert_schema_created(db_path)
     assert logger.disabled is False, "alembic fileConfig disabled the app logger"
+
+
+async def test_migration_0003_adds_response_body_backward_compatibly(tmp_database_url):
+    """FIX-22 (ТЗ §11): ``extraction_logs.response_body`` must be *nullable* and
+    default-free.
+
+    Existing log rows were written before bodies were recorded; they keep ``NULL``
+    ("no body stored"), nothing is rewritten, and a row without a body stays valid.
+    """
+    _, db_path = tmp_database_url
+    await run_migrations_async()
+
+    assert "response_body" in read_columns(db_path, "extraction_logs")
+
+    conn = sqlite3.connect(db_path)
+    try:
+        info = {row[1]: row for row in conn.execute("PRAGMA table_info(extraction_logs)")}
+    finally:
+        conn.close()
+    # row = (cid, name, type, notnull, dflt_value, pk)
+    assert info["response_body"][3] == 0, "response_body must stay nullable"
+    assert info["response_body"][4] is None, "response_body needs no server default"
+
+
+async def test_old_extraction_log_rows_survive_the_new_column(tmp_database_url):
+    """A row written before migration 0003 must still read back after it."""
+    _, db_path = tmp_database_url
+    await run_migrations_async()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO lead_sessions (telegram_user_id, status, started_at) "
+            "VALUES (1, 'done', '2026-01-01 00:00:00')"
+        )
+        conn.execute(
+            "INSERT INTO extraction_logs (session_id, model, success, created_at) "
+            "VALUES (1, 'openrouter/free', 1, '2026-01-01 00:00:00')"
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT model, success, response_body FROM extraction_logs"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row == ("openrouter/free", 1, None), "an old row must read back with NULL body"

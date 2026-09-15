@@ -7,11 +7,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import case, delete, func, or_, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.logging_config import log_json
-from app.models import AuditLog, ExtractionLog, Lead, LeadSession, RawMessage
+from app.models import AuditLog, ExtractionLog, Lead, LeadSession, RawMessage, User
 from app.schemas.extraction import ExtractionResult
 from app.services.extraction import FREE_MODEL_SUFFIXES
 from app.services.normalize import (
@@ -43,6 +43,23 @@ UNDO_SCAN_LIMIT = 100
 # buffer live in memory (MemoryStorage), so after a restart such a session can never
 # be finished — it must not stay in the database as if the user were still typing.
 UNFINISHED_SESSION_STATUSES = ("collecting", "review", "editing")
+
+# The full, meaningful set of ``lead_sessions.status`` values (FIX-25a). ``editing``
+# is written while the user corrects a field of the card, so the ТЗ vocabulary is
+# actually used instead of only being listed as "unfinished":
+#
+#   collecting — text is being gathered (buffer/timer running)
+#   review     — the bot is waiting for the user's decision on an open dialog
+#                (review card, duplicate question, manual entry)
+#   editing    — the user chose «Исправить» and is re-typing a card field
+#   done       — the lead was saved (``resulting_lead_id`` points at it)
+#   cancelled  — the dialog ended without saving, or was cut short by a restart
+SESSION_STATUSES = ("collecting", "review", "editing", "done", "cancelled")
+SESSION_STATUS_COLLECTING = "collecting"
+SESSION_STATUS_REVIEW = "review"
+SESSION_STATUS_EDITING = "editing"
+SESSION_STATUS_DONE = "done"
+SESSION_STATUS_CANCELLED = "cancelled"
 
 # Upper bound for one automatic resync pass (keeps a huge backlog from hammering
 # the Sheets API in a single burst).
@@ -125,10 +142,29 @@ class LeadService:
     def __init__(self, session_factory: async_sessionmaker):
         self.session_factory = session_factory
 
+    # ---------- access (FIX-23) ----------
+    async def is_allowed_user(self, telegram_user_id: int) -> bool:
+        """Whether *telegram_user_id* is listed in the ``users`` table.
+
+        The table existed but nothing consulted it: the allowlist came from the
+        ``ALLOWED_USER_IDS`` env var alone, so a user could only be added by editing
+        the deployment configuration. A row here is the second (persistent) source —
+        the middleware accepts either and logs which one hit.
+        """
+        async with self.session_factory() as session:
+            stmt = (
+                select(User.telegram_user_id)
+                .where(User.telegram_user_id == telegram_user_id)
+                .limit(1)
+            )
+            return await session.scalar(stmt) is not None
+
     # ---------- sessions & raw messages ----------
     async def create_session(self, telegram_user_id: int) -> int:
         async with self.session_factory() as session:
-            lead_session = LeadSession(telegram_user_id=telegram_user_id, status="collecting")
+            lead_session = LeadSession(
+                telegram_user_id=telegram_user_id, status=SESSION_STATUS_COLLECTING
+            )
             session.add(lead_session)
             await session.commit()
             await session.refresh(lead_session)
@@ -165,7 +201,7 @@ class LeadService:
             )
             hung = list(result.scalars().all())
             for lead_session in hung:
-                lead_session.status = "cancelled"
+                lead_session.status = SESSION_STATUS_CANCELLED
             await session.commit()
             return sorted(lead_session.id for lead_session in hung)
 
@@ -228,7 +264,7 @@ class LeadService:
                 lead_session = await session.get(LeadSession, session_id)
                 if lead_session is not None:
                     lead_session.resulting_lead_id = lead.id
-                    lead_session.status = "done"
+                    lead_session.status = SESSION_STATUS_DONE
                 await self._link_raw_messages(session, session_id, lead.id)
 
             await session.commit()
@@ -332,7 +368,13 @@ class LeadService:
             )
             return list(result.scalars().all())
 
-    async def search_leads(self, owner_id: int, query: str) -> list[Lead]:
+    async def search_leads(self, owner_id: int, query: str, limit: int = 20) -> list[Lead]:
+        """Literal substring search over the identifying fields, newest first.
+
+        FIX-25b: the result set is bounded (``SEARCH_RESULT_LIMIT``) and ordered by
+        date — a broad query used to return an arbitrary 10 rows in ID order, which
+        hid the recent lead the user was actually looking for.
+        """
         # FIX-17: ``%``/``_`` in the query are wildcards for LIKE, so a search for
         # «100%» used to return the whole base. Escape them and match literally.
         pattern = f"%{escape_like(query.strip())}%"
@@ -349,8 +391,10 @@ class LeadService:
                     | (Lead.website.ilike(pattern, escape=LIKE_ESCAPE))
                     | (Lead.email.ilike(pattern, escape=LIKE_ESCAPE)),
                 )
-                .order_by(Lead.id.desc())
-                .limit(10)
+                # ``created_at`` has second granularity (CURRENT_TIMESTAMP), so the
+                # id breaks ties — the order stays deterministic and newest-first.
+                .order_by(Lead.created_at.desc(), Lead.id.desc())
+                .limit(max(int(limit), 0))
             )
             return list(result.scalars().all())
 
@@ -433,6 +477,30 @@ class LeadService:
             "free_extractions": int(free_extractions or 0),
         }
 
+    # ---------- maintenance ----------
+    async def purge_extraction_logs(self, retention_days: int | None = None) -> int:
+        """Delete ``extraction_logs`` rows older than *retention_days*; returns the count.
+
+        ТЗ §11: the full LLM bodies are DEBUG-level data and must not be kept for
+        ever. ``created_at`` is written by ``CURRENT_TIMESTAMP``/``func.now()``, i.e.
+        UTC without an offset, so the cutoff is built the same way (naive UTC) and
+        the comparison stays a plain string comparison inside SQLite.
+
+        ``retention_days`` of None/<=0 keeps everything and touches nothing — that is
+        the documented way to switch the cleanup off.
+        """
+        if retention_days is None or retention_days <= 0:
+            return 0
+        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+            days=int(retention_days)
+        )
+        async with self.session_factory() as session:
+            result = await session.execute(
+                delete(ExtractionLog).where(ExtractionLog.created_at < cutoff)
+            )
+            await session.commit()
+            return int(result.rowcount or 0)
+
     # ---------- undo ----------
     async def undo_last(self, owner_id: int, sheets=None) -> str | None:
         """Reverse the actor's latest not-yet-reversed created/merged action.
@@ -443,8 +511,9 @@ class LeadService:
 
         When *sheets* is given the undo is mirrored into the table as well:
         a reversed creation blanks the lead's row, a reversed merge rewrites it
-        from the audit snapshot. Returns a human description, or None if nothing
-        is left to undo.
+        from the audit snapshot — and the merged duplicate stays archived (FIX-21),
+        so no living lead without a row is left behind. Returns a human description,
+        or None if nothing is left to undo.
         """
         message: str | None = None
         sheet_action: SheetUndo | None = None
@@ -511,6 +580,15 @@ class LeadService:
         )
 
     async def _undo_merged(self, session, owner_id: int, entry: AuditLog):
+        """Reverse a merge: the target is restored, the duplicate *stays* archived.
+
+        FIX-21: bringing the duplicate back to life produced a living lead with no
+        ``sheet_row``, so the next ``/resync`` (or the auto-resync worker) appended a
+        *second* line for a company that is already in the table. The dead row is
+        the history of the merge: it keeps ``duplicate_of_id``/``deleted_at``, and
+        only the target is written back from the audit snapshot — then the sheet row
+        of the target is brought in line with it.
+        """
         try:
             details = json.loads(entry.details or "{}")
         except ValueError:
@@ -526,18 +604,31 @@ class LeadService:
         target.last_action = "restored"
         duplicate = await session.get(Lead, duplicate_id) if duplicate_id else None
         if duplicate is not None:
-            duplicate.duplicate_of_id = None
-            duplicate.deleted_at = None
-            duplicate.last_action = "restored"
+            # Deliberately *not* ``deleted_at = None``/``duplicate_of_id = None``:
+            # the row is archive, not a lead (a resync of it would add a spare line).
+            duplicate.last_action = "merge_undone"
         session.add(
             AuditLog(
                 actor_id=owner_id,
                 action="restored",
                 lead_id=target.id,
-                details=json.dumps({"from": "merged", "lead_id": target.id}),
+                details=json.dumps(
+                    {
+                        "from": "merged",
+                        "lead_id": target.id,
+                        "duplicate_lead_id": duplicate_id,
+                        "duplicate_state": "archived",
+                    },
+                    ensure_ascii=False,
+                ),
             )
         )
-        log_json(logger, 20, "lead merge undone", lead_id=target.id, action="undo_merged")
+        log_json(
+            logger, 20, "lead merge undone (duplicate stays archived)",
+            lead_id=target.id, action="undo_merged", duplicate_lead_id=duplicate_id,
+        )
+        # A "restore" rewrites the target's line from the snapshot; when the target
+        # has no row yet the sync appends it, so the table reflects the un-merge.
         return (
             f"Отменено объединение лида #{target.id}",
             SheetUndo("restore", row=target.sheet_row, lead_id=target.id),

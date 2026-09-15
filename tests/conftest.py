@@ -64,6 +64,8 @@ class FakeSettings:
     allowed_user_ids = {1}
     GOOGLE_SHEET_ID = ""
     WEBHOOK_SECRET = ""
+    SEARCH_RESULT_LIMIT = 20
+    LAST_LEADS_LIMIT = 5
 
 
 class FakeLeads:
@@ -73,6 +75,11 @@ class FakeLeads:
         self.raw: list[str] = []
         self._sid = 1
         self._lid = 1
+        # Mirror of LeadService (FIX-23): the users table knows nobody by default.
+        self.users_table: set[int] = set()
+
+    async def is_allowed_user(self, telegram_user_id):
+        return telegram_user_id in self.users_table
 
     async def create_session(self, uid):
         sid = self._sid

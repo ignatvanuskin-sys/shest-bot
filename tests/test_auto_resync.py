@@ -299,7 +299,15 @@ async def test_started_worker_is_tracked_and_stopped_on_shutdown():
 
 
 def _flags(**overrides) -> SimpleNamespace:
-    base = {"DEV_POLLING": True, "AUTO_RESYNC_INTERVAL_SECONDS": 0.01, "GOOGLE_SHEET_ID": ""}
+    base = {
+        "DEV_POLLING": True,
+        "AUTO_RESYNC_INTERVAL_SECONDS": 0.01,
+        "GOOGLE_SHEET_ID": "",
+        # The retention worker (FIX-22) is configuration-independent, so a container
+        # stub must carry its settings for the "which workers started" assertions.
+        "EXTRACTION_LOG_RETENTION_DAYS": 30,
+        "EXTRACTION_LOG_CLEANUP_INTERVAL_SECONDS": 86400,
+    }
     base.update(overrides)
     return SimpleNamespace(**base)
 
@@ -312,6 +320,9 @@ def _stub_container(*, interval: float, configured: bool, leads=None) -> SimpleN
         async def update_lead(self, lead_id: int, **fields):
             return None
 
+        async def purge_extraction_logs(self, retention_days):
+            return 0
+
     return SimpleNamespace(
         settings=_flags(AUTO_RESYNC_INTERVAL_SECONDS=interval),
         sheets=SimpleNamespace(configured=configured),
@@ -320,13 +331,17 @@ def _stub_container(*, interval: float, configured: bool, leads=None) -> SimpleN
     )
 
 
+def _worker_names(container) -> set[str]:
+    return {task.get_name() for task in container.tasks.workers}
+
+
 async def test_start_background_workers_spawns_the_resync_worker():
     container = _stub_container(interval=0.01, configured=True)
 
     with_workers = start_background_workers(container)
 
-    assert len(with_workers) == 1
-    assert container.tasks.pending == 1
+    assert len(with_workers) == 2, "the resync worker and the retention worker"
+    assert _worker_names(container) == {"auto-resync", "extraction-log-retention"}
     await container.tasks.shutdown()
     assert container.tasks.pending == 0
 
@@ -334,16 +349,21 @@ async def test_start_background_workers_spawns_the_resync_worker():
 async def test_worker_is_not_started_when_sheets_are_unconfigured():
     container = _stub_container(interval=0.01, configured=False)
 
-    assert start_background_workers(container) == []
-    assert container.tasks.pending == 0
+    start_background_workers(container)
+
+    assert "auto-resync" not in _worker_names(container), (
+        "auto-resync without a sheet would never write anything"
+    )
+    await container.tasks.shutdown()
 
 
 async def test_interval_zero_disables_the_worker():
     container = _stub_container(interval=0, configured=True)
 
     assert build_resync_worker(container) is None
-    assert start_background_workers(container) == []
-    assert container.tasks.pending == 0
+    started = start_background_workers(container)
+    assert [task.get_name() for task in started] == ["extraction-log-retention"]
+    await container.tasks.shutdown()
 
 
 def test_auto_resync_interval_default_is_five_minutes():
