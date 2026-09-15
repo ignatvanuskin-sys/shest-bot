@@ -15,6 +15,18 @@ from app import main as main_mod
 from app.main import DEFAULT_PORT, resolve_port, resolve_webhook_url, startup_runtime
 
 
+def make_container(**settings_overrides) -> SimpleNamespace:
+    """Container stub for the startup tests.
+
+    ``startup_runtime`` also reconciles sessions the previous process left behind
+    (FIX-9), so it needs ``container.leads``; a real ``Container`` would build a
+    Telegram ``Bot`` and a database engine these offline tests do not need.
+    """
+    from tests.conftest import FakeLeads
+
+    return SimpleNamespace(settings=make_settings(**settings_overrides), leads=FakeLeads())
+
+
 def make_settings(**overrides) -> SimpleNamespace:
     base = {
         "DEV_POLLING": False,
@@ -153,9 +165,7 @@ def stub_startup(monkeypatch):
 
 
 async def test_startup_registers_webhook_from_railway_domain(stub_startup):
-    container = SimpleNamespace(
-        settings=make_settings(RAILWAY_PUBLIC_DOMAIN="leadforge.up.railway.app", WEBHOOK_SECRET="s3cr3t")
-    )
+    container = make_container(RAILWAY_PUBLIC_DOMAIN="leadforge.up.railway.app", WEBHOOK_SECRET="s3cr3t")
 
     await startup_runtime(container)
 
@@ -163,11 +173,9 @@ async def test_startup_registers_webhook_from_railway_domain(stub_startup):
 
 
 async def test_startup_prefers_explicit_webhook_url(stub_startup):
-    container = SimpleNamespace(
-        settings=make_settings(
-            WEBHOOK_URL="https://bot.example.com/webhook",
-            RAILWAY_PUBLIC_DOMAIN="leadforge.up.railway.app",
-        )
+    container = make_container(
+        WEBHOOK_URL="https://bot.example.com/webhook",
+        RAILWAY_PUBLIC_DOMAIN="leadforge.up.railway.app",
     )
 
     await startup_runtime(container)
@@ -176,9 +184,7 @@ async def test_startup_prefers_explicit_webhook_url(stub_startup):
 
 
 async def test_startup_logs_registration_result(stub_startup, logged_messages):
-    container = SimpleNamespace(
-        settings=make_settings(RAILWAY_PUBLIC_DOMAIN="leadforge.up.railway.app")
-    )
+    container = make_container(RAILWAY_PUBLIC_DOMAIN="leadforge.up.railway.app")
 
     await startup_runtime(container)
 
@@ -189,7 +195,7 @@ async def test_startup_logs_registration_result(stub_startup, logged_messages):
 
 
 async def test_startup_skips_registration_without_any_url(stub_startup, logged_messages):
-    container = SimpleNamespace(settings=make_settings())
+    container = make_container()
 
     await startup_runtime(container)
 
@@ -198,9 +204,7 @@ async def test_startup_skips_registration_without_any_url(stub_startup, logged_m
 
 
 async def test_startup_skips_registration_in_polling_mode(stub_startup):
-    container = SimpleNamespace(
-        settings=make_settings(DEV_POLLING=True, RAILWAY_PUBLIC_DOMAIN="leadforge.up.railway.app")
-    )
+    container = make_container(DEV_POLLING=True, RAILWAY_PUBLIC_DOMAIN="leadforge.up.railway.app")
 
     await startup_runtime(container)
 
@@ -218,7 +222,7 @@ async def test_startup_logs_failure_without_crashing(monkeypatch, logged_message
 
     monkeypatch.setattr(main_mod, "run_migrations_async", fake_migrations)
     monkeypatch.setattr(main_mod, "set_webhook", boom)
-    container = SimpleNamespace(settings=make_settings(RAILWAY_PUBLIC_DOMAIN="leadforge.up.railway.app"))
+    container = make_container(RAILWAY_PUBLIC_DOMAIN="leadforge.up.railway.app")
 
     await startup_runtime(container)  # must not raise
 

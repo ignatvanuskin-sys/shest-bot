@@ -276,6 +276,10 @@ class RecordingSheets(BaseSheetsSyncService):
         self.synced: list[Lead] = []
         self.appends: list[list] = []
         self.updates: list[tuple[int, list]] = []
+        # Lead IDs the service handed to ``_update`` for the row-ownership check.
+        # Kept apart from ``updates`` so the write itself is still recorded the same
+        # way the existing assertions expect — (#row, values).
+        self.update_lead_ids: list[int | None] = []
 
     @property
     def configured(self) -> bool:
@@ -285,8 +289,10 @@ class RecordingSheets(BaseSheetsSyncService):
         self.appends.append(values)
         return self.row
 
-    async def _update(self, row: int, values: list) -> None:
+    async def _update(self, row: int, values: list, lead_id: int | None = None) -> int | None:
         self.updates.append((row, values))
+        self.update_lead_ids.append(lead_id)
+        return row
 
     async def sync_lead(self, lead):
         self.synced.append(lead)
@@ -445,10 +451,13 @@ async def harness(tmp_path, monkeypatch):
         yield harness
     finally:
         await container.session_buffer.shutdown()
-        # Fire-and-forget tasks (flow uses ``asyncio.create_task(sync_and_notify)``)
-        # hold aiosqlite sessions; destroying them mid-await leaks work into the
-        # next test (symptoms: "coroutine ... was never awaited", "Event loop is
-        # closed" raised inside an aiosqlite worker thread). Drain them first.
+        # Fire-and-forget jobs (flow.spawn_sync → container.tasks) hold aiosqlite
+        # sessions; destroying them mid-await leaks work into the next test
+        # (symptoms: "coroutine ... was never awaited", "Event loop is closed" raised
+        # inside an aiosqlite worker thread). Drain them through the same registry
+        # production uses at shutdown, then sweep whatever is left.
+        with suppress(Exception):
+            await container.tasks.shutdown(timeout=5)
         current = asyncio.current_task()
         pending = [task for task in asyncio.all_tasks() if task is not current]
         if pending:

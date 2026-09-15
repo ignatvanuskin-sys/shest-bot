@@ -9,6 +9,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from app.config import Settings, get_settings
 from app.database import create_engine_and_sessionmaker
 from app.logging_config import log_json
+from app.services.background import BackgroundTasks
 from app.services.dedup import DedupService
 from app.services.extraction import ExtractionService
 from app.services.lead_service import LeadService
@@ -28,6 +29,9 @@ class Container:
         )
         self.bot = Bot(token=self.settings.BOT_TOKEN)
         self.dp = Dispatcher(storage=MemoryStorage())
+        # Keeps strong references to fire-and-forget jobs (sheet syncs, the periodic
+        # resync worker) and drains them on shutdown.
+        self.tasks = BackgroundTasks()
 
         self.session_buffer = SessionBufferService(self.settings.COLLECT_TIMEOUT_SECONDS)
         self.leads = LeadService(self.session_factory)
@@ -51,6 +55,9 @@ class Container:
             log_json(logger, 20, "configuration complete", action="config_ok")
 
     async def close(self) -> None:
+        # Order matters: in-flight sheet syncs must finish (and get their notification
+        # out) before the clients and the engine they use are torn down.
+        await self.tasks.shutdown()
         await self.session_buffer.shutdown()
         await self.extraction.close()
         await self.sheets.close()

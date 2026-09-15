@@ -1,7 +1,6 @@
 """Flow orchestration: buffer → extraction → dedup → review → save. Testable without Telegram."""
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -288,7 +287,7 @@ async def _finalize_collection(container, user_id: int, chat_id: int, state: FSM
                 user_id, extracted, session_id, merge_target_id=match.lead_id
             )
             # ``lead`` is the dead duplicate row; the merged values live on the target.
-            asyncio.create_task(sync_and_notify(container, merge_sync_target(lead), chat_id))
+            spawn_sync(container, merge_sync_target(lead), chat_id)
             await state.clear()
             await notify(
                 container,
@@ -365,7 +364,7 @@ async def confirm_add(container, user_id: int, chat_id: int, state: FSMContext) 
         )
         return
     lead = await container.leads.add_lead(user_id, extracted, session_id)
-    asyncio.create_task(sync_and_notify(container, lead.id, chat_id))
+    spawn_sync(container, lead.id, chat_id)
     await state.clear()
     await notify(
         container,
@@ -390,7 +389,7 @@ async def handle_duplicate_choice(
 
     if choice == "new":
         lead = await container.leads.add_lead(user_id, extracted, session_id)
-        asyncio.create_task(sync_and_notify(container, lead.id, chat_id))
+        spawn_sync(container, lead.id, chat_id)
         await state.clear()
         await notify(
             container,
@@ -408,7 +407,7 @@ async def handle_duplicate_choice(
         merge_target_id=existing_id, prefer_new_contact=prefer_new_contact,
     )
     # Same as the auto-merge branch: only the live target has a sheet_row to update.
-    asyncio.create_task(sync_and_notify(container, merge_sync_target(lead), chat_id))
+    spawn_sync(container, merge_sync_target(lead), chat_id)
     await state.clear()
     await notify(
         container,
@@ -541,6 +540,19 @@ def merge_sync_target(lead: Lead) -> int:
     real lead's row keeps the pre-merge values. Only the merge target must be synced.
     """
     return lead.duplicate_of_id or lead.id
+
+
+def spawn_sync(container, lead_id: int, chat_id: int) -> None:
+    """Queue the background sheet sync for *lead_id*.
+
+    Goes through the container's task registry instead of a bare
+    ``asyncio.create_task``: the reference is kept until the job finishes (a task the
+    loop only sees through a local variable can be collected mid-flight), failures are
+    visible, and graceful shutdown drains it instead of dropping the sync.
+    """
+    container.tasks.spawn(
+        sync_and_notify(container, lead_id, chat_id), name=f"sheets-sync-{lead_id}"
+    )
 
 
 async def sync_and_notify(container, lead_id: int, chat_id: int) -> None:

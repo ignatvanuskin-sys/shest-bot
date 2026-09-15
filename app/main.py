@@ -14,6 +14,8 @@ from app.config import get_settings
 from app.database import run_migrations_async
 from app.di import build_container
 from app.logging_config import setup_logging
+from app.services.background import start_background_workers
+from app.services.startup import reconcile_hung_sessions
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +71,9 @@ def init_app(settings=None):
 async def startup_runtime(container) -> None:
     """Run migrations and register the webhook when in webhook mode."""
     await run_migrations_async()
+    # Sessions whose dialog lived in memory died with the previous process: close
+    # them out now, otherwise they stay «collecting»/«review» for ever (FIX-9).
+    await reconcile_hung_sessions(container.leads)
     settings = container.settings
     if settings.DEV_POLLING:
         logger.info("DEV_POLLING=true — long polling mode, webhook is not registered")
@@ -99,6 +104,7 @@ async def startup_runtime(container) -> None:
 async def lifespan(app: FastAPI):
     container = init_app()
     await startup_runtime(container)
+    start_background_workers(container)
     yield
     await container.close()
 
@@ -133,7 +139,8 @@ async def webhook(update: dict, request: Request) -> JSONResponse:
 
 async def run_polling() -> None:
     container = init_app()
-    await run_migrations_async()
+    await startup_runtime(container)
+    start_background_workers(container)
     logger.info("starting long polling (DEV_POLLING)")
     try:
         await container.dp.start_polling(container.bot, drop_pending_updates=True)

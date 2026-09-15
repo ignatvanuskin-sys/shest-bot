@@ -84,6 +84,15 @@ class FakeLeads:
         if sid in self.sessions:
             self.sessions[sid].update(kw)
 
+    async def cancel_unfinished_sessions(self, statuses=("collecting", "review", "editing")):
+        """Mirror of LeadService: open sessions die with the process that held them."""
+        ids = sorted(
+            sid for sid, data in self.sessions.items() if data.get("status") in statuses
+        )
+        for sid in ids:
+            self.sessions[sid]["status"] = "cancelled"
+        return ids
+
     async def add_raw_message(self, sid, lid, text):
         self.raw.append(text)
 
@@ -136,8 +145,10 @@ class FakeContainer:
     def __init__(self, *, extraction=None, dedup=None, leads=None, bot=None):
         self.bot = bot or FakeBot()
         self.settings = FakeSettings()
+        from app.services.background import BackgroundTasks
         from app.services.session_buffer import SessionBufferService
 
+        self.tasks = BackgroundTasks()
         self.session_buffer = SessionBufferService(timeout_seconds=0.05)
         self.leads = leads or FakeLeads()
         self.extraction = extraction or FakeExtraction()

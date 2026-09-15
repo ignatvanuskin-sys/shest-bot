@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     DEV_POLLING: bool = False
     COLLECT_TIMEOUT_SECONDS: float = 7.0
     DEFAULT_CITY: str = "Алматы"
+    # Automatic resync of leads left without a sheet row (the /resync queue).
+    # Seconds between passes; 0 or less switches the worker off.
+    AUTO_RESYNC_INTERVAL_SECONDS: float = 300.0
 
     @property
     def allowed_user_ids(self) -> set[int]:

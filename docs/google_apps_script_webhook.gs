@@ -49,6 +49,19 @@
  * добавляется, а возвращается {"ok":true,"row":<номер существующей строки>,
  * "duplicate":true}. Пустой values[0] означает «добавить без проверки».
  * Поиск идёт по диапазону колонки A (TextFinder), а не по всему листу.
+ *
+ * Проверка строки при update (FIX-7): update может прийти с дополнительным полем
+ * lead_id — ID лида, чью строку обновляем. Кэш row у клиента (lead.sheet_row) —
+ * только подсказка: если в таблице вручную вставили или удалили строку, все номера
+ * ниже сдвигаются, и запись «по голому номеру» перезаписывает ЧУЖОГО лида. Поэтому
+ * скрипт перед записью сверяет A{row}:
+ *   - совпало — пишем в row;
+ *   - не совпало — ищем строку по ID через findRowById и пишем в неё;
+ *   - не нашли и строка пуста, а запись пустая (retry /undo после потерянного
+ *     ответа) — считаем очистку уже выполненной;
+ *   - не нашли — НЕ пишем и отвечаем {"ok":false,"error":"row not found for id ..."}.
+ * В ответе возвращается фактический номер строки: {"ok":true,"row":N}.
+ * Если поля lead_id нет (старый клиент) — поведение прежнее, запись по row.
  */
 
 var TOKEN = "ЗАМЕНИТЕ_НА_СВОЙ_ТОКЕН";
@@ -140,8 +153,32 @@ function doPost(e) {
         out.setContent(JSON.stringify({ ok: false, error: "row must be a positive integer" }));
         return out;
       }
+
+      // FIX-7: не доверяем номеру строки из кэша клиента. Если пришёл lead_id —
+      // убеждаемся, что в A{row} стоит именно он, иначе ищем строку по ID.
+      var updateLeadId = payload.lead_id;
+      if (!isBlank(updateLeadId)) {
+        if (!rowHoldsId(sheet, row, updateLeadId)) {
+          var movedRow = findRowById(sheet, updateLeadId);
+          if (movedRow > 0) {
+            row = movedRow;
+          } else if (allBlank(values) && rowIsBlank(sheet, payload.row)) {
+            // Повтор потерянного ответа на очистку строки (/undo): строка уже
+            // пуста, писать нечего — это успех, а не ошибка.
+            out.setContent(JSON.stringify({ ok: true, row: payload.row, blank: true }));
+            return out;
+          } else {
+            out.setContent(JSON.stringify({
+              ok: false,
+              error: "row not found for id " + updateLeadId
+            }));
+            return out;
+          }
+        }
+      }
+
       sheet.getRange(row, 1, 1, COLUMN_COUNT).setValues([values]);
-      out.setContent(JSON.stringify({ ok: true }));
+      out.setContent(JSON.stringify({ ok: true, row: row }));
       return out;
     }
 
@@ -197,4 +234,36 @@ function findRowById(sheet, leadId) {
     .matchEntireCell(true)
     .findNext();
   return found ? found.getRow() : 0;
+}
+
+/** Пустое значение ячейки (null/undefined/"" — одно и то же). */
+function isBlank(value) {
+  return value === null || value === undefined || String(value).trim() === "";
+}
+
+/** Все ли значения строки пусты (запись — это очистка строки). */
+function allBlank(values) {
+  for (var i = 0; i < values.length; i++) {
+    if (!isBlank(values[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Стоит ли в колонке A строки row именно этот ID (сравнение по строке). */
+function rowHoldsId(sheet, row, leadId) {
+  if (row > sheet.getLastRow()) {
+    return false;
+  }
+  var value = sheet.getRange(row, 1, 1, 1).getValue();
+  return !isBlank(value) && String(value).trim() === String(leadId).trim();
+}
+
+/** Пуста ли вся строка (все 27 колонок) — защита от записи в чужую строку. */
+function rowIsBlank(sheet, row) {
+  if (row > sheet.getLastRow()) {
+    return true;
+  }
+  return allBlank(sheet.getRange(row, 1, 1, COLUMN_COUNT).getValues()[0]);
 }

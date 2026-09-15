@@ -37,6 +37,23 @@ def tmp_database_url(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
+def _stub_container(*, dev_polling: bool = True):
+    """Minimal container stub for startup tests.
+
+    ``startup_runtime`` needs ``settings`` and ``leads`` (it reconciles sessions that
+    the previous process left behind); a real ``Container`` would build a Telegram
+    ``Bot`` and an engine that these migration tests do not need.
+    """
+    from types import SimpleNamespace
+
+    from tests.conftest import FakeLeads
+
+    return SimpleNamespace(
+        settings=SimpleNamespace(DEV_POLLING=dev_polling),
+        leads=FakeLeads(),
+    )
+
+
 def read_tables(db_path) -> set[str]:
     conn = sqlite3.connect(db_path)
     try:
@@ -102,7 +119,7 @@ async def test_startup_runtime_migrates_inside_running_loop(tmp_database_url):
     from app.main import startup_runtime
 
     _, db_path = tmp_database_url
-    container = SimpleNamespace(settings=SimpleNamespace(DEV_POLLING=True))
+    container = _stub_container()
 
     await startup_runtime(container)
 
@@ -125,7 +142,7 @@ async def test_migrations_do_not_disable_app_loggers(tmp_database_url):
     _, db_path = tmp_database_url
     logger = logging.getLogger("app.main")
     logger.disabled = False
-    container = SimpleNamespace(settings=SimpleNamespace(DEV_POLLING=True))
+    container = _stub_container()
 
     await startup_runtime(container)
 

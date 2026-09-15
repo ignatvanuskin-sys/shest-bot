@@ -1,4 +1,12 @@
-"""Google Sheets sync service — mirrors a lead row into a Google Sheet (async, retrying)."""
+"""Google Sheets sync service — mirrors a lead row into a Google Sheet (async, retrying).
+
+Two rules keep the table and the database from drifting apart (FIX-7/FIX-8):
+
+* a row is written only after its column A is confirmed to hold this lead's ID — a
+  cached ``sheet_row`` is a hint, never proof (a hand-edited table shifts rows);
+* appending is idempotent by ID, so a retry after a lost response reuses the existing
+  line instead of adding a second one.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -68,6 +76,64 @@ def _format_datetime(value: datetime | None) -> str:
     return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
+# ---------------- row identity (FIX-7 / FIX-8) ----------------
+#
+# ``lead.sheet_row`` is only a *cache* of a row number. It goes stale whenever the
+# table is edited by hand: inserting or deleting one line shifts every line below it,
+# and the bot would silently overwrite whatever lead ended up on the cached number.
+# Both backends therefore verify column A before writing — the exact same rule the
+# Apps Script webhook implements in ``findRowById`` (docs/google_apps_script_webhook.gs).
+
+
+def lead_id_from_values(values: list) -> str:
+    """The lead ID of a row payload. Column A by contract (shared with the .gs script)."""
+    if not values:
+        return ""
+    first = values[0]
+    return "" if first is None else str(first).strip()
+
+
+def row_holds_lead(column_a: list, row: int, lead_id) -> bool:
+    """Whether sheet ``row`` (1-based) carries *lead_id* in column A."""
+    if row is None or row < 1 or row > len(column_a):
+        return False
+    value = column_a[row - 1]
+    return value is not None and str(value).strip() == str(lead_id)
+
+
+def find_row_by_id(column_a: list, lead_id) -> int | None:
+    """Row (1-based) whose column A is exactly *lead_id*; row 1 (headers) is skipped."""
+    target = "" if lead_id is None else str(lead_id).strip()
+    if not target:
+        return None
+    for index, value in enumerate(column_a, start=1):
+        if index == 1 or value is None:
+            continue
+        if str(value).strip() == target:
+            return index
+    return None
+
+
+def resolve_row_for_lead(column_a: list, row: int, lead_id) -> int:
+    """The row that actually holds *lead_id* — never a bare cached number.
+
+    Raises :class:`SheetsError` when the ID is nowhere in column A: writing to the
+    cached row anyway is exactly the corruption this guards against.
+    """
+    if row_holds_lead(column_a, row, lead_id):
+        return row
+    found = find_row_by_id(column_a, lead_id)
+    if found is None:
+        raise SheetsError(
+            f"строка {row} не принадлежит лиду {lead_id}, и лид не найден в колонке A"
+        )
+    log_json(
+        logger, 30, "sheet row moved — writing to the row that holds this lead",
+        lead_id=lead_id, action="sheets_row_moved", cached_row=row, sheet_row=found,
+    )
+    return found
+
+
 def lead_to_row_values(lead: Lead) -> list:
     """Build the 27 column values for a lead, in the fixed A..AA order."""
     return [
@@ -134,7 +200,15 @@ class BaseSheetsSyncService:
             for attempt in range(1, RETRY_MAX + 1):
                 try:
                     if lead.sheet_row:
-                        await self._update(lead.sheet_row, values)
+                        # ``lead_id`` makes the backend verify that the cached row is
+                        # really this lead's line (the table may have been edited by
+                        # hand). A backend that re-targeted the row reports it back so
+                        # the cache can be repaired instead of drifting for ever.
+                        actual = await self._update(
+                            lead.sheet_row, values, lead_id=lead.id
+                        )
+                        if actual and actual != lead.sheet_row:
+                            lead.sheet_row = actual
                     else:
                         row = await self._append(values)
                         lead.sheet_row = row
@@ -154,7 +228,7 @@ class BaseSheetsSyncService:
             log_json(logger, 40, "sheets sync failed after retries", lead_id=lead.id)
             return None
 
-    async def clear_row(self, row: int | None) -> bool:
+    async def clear_row(self, row: int | None, lead_id: int | None = None) -> bool:
         """Blank the 27 cells of a sheet line. Returns True when it went through.
 
         Deliberately *not* routed through ``sync_lead``/``is_syncable``: /undo of a
@@ -162,6 +236,9 @@ class BaseSheetsSyncService:
         sync path — yet the line still has to leave the table. The line itself is
         kept (empty) so lead numbering and the Apps Script append contract are
         untouched.
+
+        *lead_id* is forwarded so the backend can verify the line before blanking it
+        (the undo carries the ID of the lead whose row it wants cleared).
         """
         if not row:
             return False
@@ -176,7 +253,7 @@ class BaseSheetsSyncService:
         async with self._lock:
             for attempt in range(1, RETRY_MAX + 1):
                 try:
-                    await self._update(row, values)
+                    await self._update(row, values, lead_id=lead_id)
                     log_json(
                         logger, 20, "sheets row cleared",
                         sheet_row=row, action="sheets_clear",
@@ -198,7 +275,11 @@ class BaseSheetsSyncService:
     async def _append(self, values: list) -> int:
         raise NotImplementedError
 
-    async def _update(self, row: int, values: list) -> None:
+    async def _update(self, row: int, values: list, lead_id: int | None = None) -> int | None:
+        """Write *values* into the row of *lead_id*; returns the row actually written.
+
+        ``None`` means "the backend could not tell" — callers keep the cached number.
+        """
         raise NotImplementedError
 
     async def close(self) -> None:
@@ -246,18 +327,35 @@ class SheetsSyncService(BaseSheetsSyncService):
     async def _append(self, values: list) -> int:
         def _run():
             ws = self._worksheet_sync()
+            # Appending is idempotent by ID, exactly like the Apps Script backend
+            # (FIX-8): a lost response makes the client retry, and the retry used to
+            # add a second line for the same lead. Look the ID up in column A first.
+            lead_id = lead_id_from_values(values)
+            if lead_id:
+                existing = find_row_by_id(ws.col_values(1), lead_id)
+                if existing is not None:
+                    log_json(
+                        logger, 30, "append skipped — the lead already has a row",
+                        lead_id=lead_id, action="sheets_append_duplicate",
+                        sheet_row=existing,
+                    )
+                    return existing
             ws.append_row(values, value_input_option="USER_ENTERED")
             # row index == current row count (header in row 1)
             return len(ws.get_all_values())
 
         return await asyncio.to_thread(_run)
 
-    async def _update(self, row: int, values: list) -> None:
+    async def _update(self, row: int, values: list, lead_id: int | None = None) -> int | None:
         def _run():
             ws = self._worksheet_sync()
-            ws.update(f"A{row}:AA{row}", [values], value_input_option="USER_ENTERED")
+            target = row if lead_id is None else resolve_row_for_lead(
+                ws.col_values(1), row, lead_id
+            )
+            ws.update(f"A{target}:AA{target}", [values], value_input_option="USER_ENTERED")
+            return target
 
-        await asyncio.to_thread(_run)
+        return await asyncio.to_thread(_run)
 
 
 class WebhookSheetsSyncService(BaseSheetsSyncService):
@@ -290,12 +388,29 @@ class WebhookSheetsSyncService(BaseSheetsSyncService):
         row = await self._request("append", values=values)
         return row
 
-    async def _update(self, row: int, values: list) -> None:
-        await self._request("update", row=row, values=values)
+    async def _update(self, row: int, values: list, lead_id: int | None = None) -> int | None:
+        """Send the update with the lead ID so the script can verify the row.
 
-    async def _request(self, action: str, values: list, row: int | None = None) -> int | None:
+        The script answers ``{"ok":true,"row":N}`` with the row it really wrote. It
+        re-targets the row by ID when the cached number no longer holds this lead,
+        and refuses to write at all (``ok:false``) when the lead is not in the table.
+        """
+        return await self._request("update", row=row, values=values, lead_id=lead_id)
+
+    async def _request(
+        self, action: str, values: list, row: int | None = None, lead_id: int | None = None
+    ) -> int | None:
         payload = json.dumps(
-            {"token": self.webhook_token, "action": action, "row": row, "values": values},
+            {
+                "token": self.webhook_token,
+                "action": action,
+                "row": row,
+                # Extra field for the script's row-ownership check. An older deployment
+                # simply ignores it and keeps writing to ``row`` (graceful degradation
+                # to the pre-FIX-7 behaviour) — hence no version negotiation here.
+                "lead_id": lead_id,
+                "values": values,
+            },
             ensure_ascii=False,
         )
         try:
@@ -319,10 +434,16 @@ class WebhookSheetsSyncService(BaseSheetsSyncService):
             error = data.get("error") if isinstance(data, dict) else None
             raise SheetsError(error or "webhook returned ok=false")
 
+        actual = data.get("row")
         if action == "append":
-            row = data.get("row")
-            if not isinstance(row, int):
+            if not isinstance(actual, int):
                 raise SheetsError("webhook append response missing 'row'")
+            return actual
+        if action == "update":
+            # An older script answers a bare {"ok":true}: keep trusting the cache
+            # (degradation), a newer one reports the row it actually wrote.
+            if isinstance(actual, int) and actual > 0:
+                return actual
             return row
         return None
 

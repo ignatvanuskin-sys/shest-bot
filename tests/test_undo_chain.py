@@ -38,7 +38,7 @@ class NoSheetRow(RecordingSheets):
     async def sync_lead(self, lead):
         return None
 
-    async def clear_row(self, row):
+    async def clear_row(self, row, lead_id=None):
         return False
 
 

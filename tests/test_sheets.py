@@ -77,13 +77,31 @@ async def test_sync_update_uses_cached_row(monkeypatch):
     lead = models.Lead(id=1, sheet_row=7)
     calls = []
 
-    async def fake_update(row, values):
-        calls.append((row, values))
+    async def fake_update(row, values, lead_id=None):
+        calls.append((row, values, lead_id))
 
     monkeypatch.setattr(svc, "_update", fake_update)
     row = await svc.sync_lead(lead)
     assert row == 7
-    assert calls and calls[0][0] == 7
+    assert [call[0] for call in calls] == [7]
+    # FIX-7: the backend must receive the lead identity, not just a row number.
+    assert calls[0][2] == 1, "the update must carry the lead id for the ownership check"
+
+
+@pytest.mark.asyncio
+async def test_sync_update_follows_a_moved_row_and_repairs_the_cache(monkeypatch):
+    """A backend that re-targeted the row reports it back → the cached number heals."""
+    svc = SheetsSyncService("sheetid", "e30=")
+    lead = models.Lead(id=1, sheet_row=7)
+
+    async def fake_update(row, values, lead_id=None):
+        return 12  # a line was inserted above: the lead now lives on row 12
+
+    monkeypatch.setattr(svc, "_update", fake_update)
+    row = await svc.sync_lead(lead)
+
+    assert row == 12
+    assert lead.sheet_row == 12, "the stale row number must not stay in the cache"
 
 
 @pytest.mark.asyncio
@@ -92,7 +110,7 @@ async def test_clear_row_blanks_27_cells_and_keeps_the_line(monkeypatch):
     svc = SheetsSyncService("sheetid", "e30=")
     calls = []
 
-    async def fake_update(row, values):
+    async def fake_update(row, values, lead_id=None):
         calls.append((row, values))
 
     monkeypatch.setattr(svc, "_update", fake_update)
@@ -108,7 +126,7 @@ async def test_clear_row_reports_failure_after_retries(monkeypatch):
     svc = SheetsSyncService("sheetid", "e30=")
     attempts = {"n": 0}
 
-    async def flaky(row, values):
+    async def flaky(row, values, lead_id=None):
         attempts["n"] += 1
         raise RuntimeError("boom")
 
@@ -174,7 +192,7 @@ async def test_sync_refuses_merged_or_deleted_rows(shape, monkeypatch, caplog):
         appends.append(values)
         return 5
 
-    async def fake_update(row, values):
+    async def fake_update(row, values, lead_id=None):
         updates.append((row, values))
 
     monkeypatch.setattr(svc, "_append", fake_append)

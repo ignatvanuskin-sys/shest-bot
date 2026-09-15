@@ -31,6 +31,15 @@ REVERSAL_MARKERS = {"created": "deleted", "merged": "restored"}
 # How far back the undo chain looks for an action that is not reversed yet.
 UNDO_SCAN_LIMIT = 100
 
+# Session statuses that mean "a dialog was still in flight". The FSM and the message
+# buffer live in memory (MemoryStorage), so after a restart such a session can never
+# be finished — it must not stay in the database as if the user were still typing.
+UNFINISHED_SESSION_STATUSES = ("collecting", "review", "editing")
+
+# Upper bound for one automatic resync pass (keeps a huge backlog from hammering
+# the Sheets API in a single burst).
+RESYNC_BATCH_LIMIT = 200
+
 
 @dataclass(frozen=True)
 class SheetUndo:
@@ -120,6 +129,25 @@ class LeadService:
             for raw in result.scalars().all():
                 raw.lead_id = lead_id
             await session.commit()
+
+    async def cancel_unfinished_sessions(
+        self, statuses: tuple[str, ...] = UNFINISHED_SESSION_STATUSES
+    ) -> list[int]:
+        """Mark sessions interrupted by a restart as ``cancelled``; returns their ids.
+
+        Their FSM state and buffered text died with the process, so ``collecting`` /
+        ``review`` rows are dead ends. Leaving them as-is made the database claim the
+        user was still mid-dialog.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(LeadSession).where(LeadSession.status.in_(statuses))
+            )
+            hung = list(result.scalars().all())
+            for lead_session in hung:
+                lead_session.status = "cancelled"
+            await session.commit()
+            return sorted(lead_session.id for lead_session in hung)
 
     # ---------- leads ----------
     async def get_lead(self, lead_id: int) -> Lead | None:
@@ -247,6 +275,29 @@ class LeadService:
                     Lead.duplicate_of_id.is_(None),
                     Lead.sheet_row.is_(None),
                 )
+            )
+            return list(result.scalars().all())
+
+    async def get_unsynced_leads_all_owners(
+        self, limit: int = RESYNC_BATCH_LIMIT
+    ) -> list[Lead]:
+        """The resync queue (leads with no sheet row yet) across every owner.
+
+        Same shape as :meth:`get_unsynced_leads`, but not scoped to one user: the
+        periodic worker has no owner context. Merged/deleted rows are excluded here
+        and refused again by ``sheets.is_syncable`` — they are audit history, not
+        leads waiting for a row.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Lead)
+                .where(
+                    Lead.deleted_at.is_(None),
+                    Lead.duplicate_of_id.is_(None),
+                    Lead.sheet_row.is_(None),
+                )
+                .order_by(Lead.id)
+                .limit(limit)
             )
             return list(result.scalars().all())
 
@@ -445,7 +496,7 @@ class LeadService:
             if sheet_action.kind == "clear":
                 if not sheet_action.row:
                     return None
-                if await sheets.clear_row(sheet_action.row):
+                if await sheets.clear_row(sheet_action.row, lead_id=sheet_action.lead_id):
                     return None
                 return " Строку в таблице очистить не удалось — повторите /undo."
             lead = await self.get_lead(sheet_action.lead_id)
