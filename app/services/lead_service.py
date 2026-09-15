@@ -7,13 +7,20 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.logging_config import log_json
 from app.models import AuditLog, ExtractionLog, Lead, LeadSession, RawMessage
 from app.schemas.extraction import ExtractionResult
-from app.services.normalize import normalize_phone, normalize_social_handle, normalize_website
+from app.services.extraction import FREE_MODEL_SUFFIXES
+from app.services.normalize import (
+    LIKE_ESCAPE,
+    escape_like,
+    normalize_phone,
+    normalize_social_handle,
+    normalize_website,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +30,7 @@ CONTACT_FIELDS = ("phone", "whatsapp_number", "email", "instagram", "telegram", 
 FILL_FIELDS = (
     "company_name", "category", "city", "address", "description",
     "rating", "reviews_count", "contact_person", "source", "source_url",
+    "phone_raw",
 )
 
 # Audit actions /undo can reverse, and the marker it writes when it did.
@@ -59,13 +67,18 @@ def extracted_to_lead_fields(owner_id: int, data: ExtractionResult) -> dict:
         "city": data.city,
         "address": data.address,
         "phone": data.phone_e164 or normalize_phone(data.phone_raw),
+        # ТЗ §7: keep the raw spelling next to the normalized one, so the audit can
+        # see what the source actually said (FIX-11).
+        "phone_raw": data.phone_raw,
         "whatsapp_number": normalize_phone(data.whatsapp_number),
         "email": data.email,
         "instagram": normalize_social_handle(data.instagram),
         "telegram": normalize_social_handle(data.telegram),
         "website": normalize_website(data.website),
         "source": data.source_guess,
-        "source_url": data.source_url,
+        # FIX-13: same utm/fbclid cleaning as ``website`` — a source link copied from
+        # 2GIS/Instagram otherwise keeps its tracking noise for ever.
+        "source_url": normalize_website(data.source_url),
         "services": json.dumps(data.services, ensure_ascii=False) if data.services else None,
         "tags": json.dumps(data.tags, ensure_ascii=False) if data.tags else None,
         "description": data.description,
@@ -76,6 +89,22 @@ def extracted_to_lead_fields(owner_id: int, data: ExtractionResult) -> dict:
         "status": "новый",
         "last_action": "created",
     }
+
+
+def describe_cost(cost_usd: float, extractions: int = 0, free_extractions: int = 0) -> str:
+    """Human wording for the «расход на AI» line of /stats (FIX-11).
+
+    A zero is only reported as a *free model* when every logged extraction really
+    ran on a ``:free`` model; when the provider reported no price for a paid model
+    the line says so instead of implying a measured 0.
+    """
+    if cost_usd > 0:
+        return f"${cost_usd:.6f}"
+    if extractions <= 0:
+        return "нет данных (обращений к AI ещё не было)"
+    if free_extractions >= extractions:
+        return "$0 (бесплатная модель)"
+    return "$0 (тариф модели не учтён)"
 
 
 def _merge_json_arrays(existing: str | None, incoming: str | None) -> str | None:
@@ -119,15 +148,6 @@ class LeadService:
     ) -> None:
         async with self.session_factory() as session:
             session.add(RawMessage(session_id=session_id, lead_id=lead_id, message_text=text))
-            await session.commit()
-
-    async def link_raw_messages_to_lead(self, session_id: int, lead_id: int) -> None:
-        async with self.session_factory() as session:
-            result = await session.execute(
-                select(RawMessage).where(RawMessage.session_id == session_id)
-            )
-            for raw in result.scalars().all():
-                raw.lead_id = lead_id
             await session.commit()
 
     async def cancel_unfinished_sessions(
@@ -313,19 +333,21 @@ class LeadService:
             return list(result.scalars().all())
 
     async def search_leads(self, owner_id: int, query: str) -> list[Lead]:
-        pattern = f"%{query.strip()}%"
+        # FIX-17: ``%``/``_`` in the query are wildcards for LIKE, so a search for
+        # «100%» used to return the whole base. Escape them and match literally.
+        pattern = f"%{escape_like(query.strip())}%"
         async with self.session_factory() as session:
             result = await session.execute(
                 select(Lead)
                 .where(
                     Lead.owner_user_id == owner_id,
                     Lead.deleted_at.is_(None),
-                    (Lead.company_name.ilike(pattern))
-                    | (Lead.phone.ilike(pattern))
-                    | (Lead.instagram.ilike(pattern))
-                    | (Lead.telegram.ilike(pattern))
-                    | (Lead.website.ilike(pattern))
-                    | (Lead.email.ilike(pattern)),
+                    (Lead.company_name.ilike(pattern, escape=LIKE_ESCAPE))
+                    | (Lead.phone.ilike(pattern, escape=LIKE_ESCAPE))
+                    | (Lead.instagram.ilike(pattern, escape=LIKE_ESCAPE))
+                    | (Lead.telegram.ilike(pattern, escape=LIKE_ESCAPE))
+                    | (Lead.website.ilike(pattern, escape=LIKE_ESCAPE))
+                    | (Lead.email.ilike(pattern, escape=LIKE_ESCAPE)),
                 )
                 .order_by(Lead.id.desc())
                 .limit(10)
@@ -333,6 +355,13 @@ class LeadService:
             return list(result.scalars().all())
 
     async def get_stats(self, owner_id: int) -> dict:
+        """Counters for /stats, scoped to one owner (ТЗ §7/§11).
+
+        The AI counters come from ``extraction_logs`` attributed through the owner's
+        lead sessions — the same rule the cost sum always used. ``free_extractions``
+        lets the caller say «0 (бесплатная модель)» instead of pretending a zero cost
+        is a measured spend.
+        """
         now = datetime.now(timezone.utc)
         week_ago = now - timedelta(days=7)
         async with self.session_factory() as session:
@@ -356,16 +385,52 @@ class LeadService:
                     Lead.owner_user_id == owner_id, Lead.duplicate_of_id.is_not(None)
                 )
             )
-            cost = await session.scalar(
-                select(func.coalesce(func.sum(ExtractionLog.cost_usd_est), 0.0))
-                .join(LeadSession, ExtractionLog.session_id == LeadSession.id)
-                .where(LeadSession.telegram_user_id == owner_id)
-            )
+            usage = (
+                await session.execute(
+                    select(
+                        func.count(ExtractionLog.id),
+                        func.coalesce(
+                            func.sum(
+                                case((ExtractionLog.success.is_(True), 1), else_=0)
+                            ),
+                            0,
+                        ),
+                        func.coalesce(func.sum(ExtractionLog.tokens_in), 0),
+                        func.coalesce(func.sum(ExtractionLog.tokens_out), 0),
+                        func.coalesce(func.sum(ExtractionLog.cost_usd_est), 0.0),
+                        func.coalesce(
+                            func.sum(
+                                case(
+                                    (
+                                        or_(
+                                            *[
+                                                ExtractionLog.model.like(f"%{suffix}")
+                                                for suffix in FREE_MODEL_SUFFIXES
+                                            ]
+                                        ),
+                                        1,
+                                    ),
+                                    else_=0,
+                                )
+                            ),
+                            0,
+                        ),
+                    )
+                    .join(LeadSession, ExtractionLog.session_id == LeadSession.id)
+                    .where(LeadSession.telegram_user_id == owner_id)
+                )
+            ).one()
+        extractions, extractions_ok, tokens_in, tokens_out, cost, free_extractions = usage
         return {
             "total": int(total or 0),
             "week": int(week or 0),
             "duplicates": int(duplicates or 0),
+            "extractions": int(extractions or 0),
+            "extractions_ok": int(extractions_ok or 0),
+            "tokens_in": int(tokens_in or 0),
+            "tokens_out": int(tokens_out or 0),
             "cost_usd": float(cost or 0.0),
+            "free_extractions": int(free_extractions or 0),
         }
 
     # ---------- undo ----------

@@ -23,6 +23,19 @@ FALLBACK_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 
+# How a free OpenRouter model is spelled: a ``:free`` suffix, or the ``/free``
+# router alias (``openrouter/free`` is the default primary model here). Both cost
+# nothing — and both still yield a real ``usage.cost`` when the provider sends one,
+# which is why the reported value wins over this predicate (FIX-11).
+FREE_MODEL_SUFFIXES = (":free", "/free")
+
+
+def is_free_model(model: str | None) -> bool:
+    """Whether *model* names a free OpenRouter model (suffix or router alias)."""
+    if not model:
+        return False
+    return str(model).strip().lower().endswith(FREE_MODEL_SUFFIXES)
+
 # Approximate pricing (USD per 1 token) for non-:free models, used only as a
 # fallback when the API response does not include ``usage.cost``.
 PRICING: dict[str, dict[str, float]] = {
@@ -102,7 +115,6 @@ SYSTEM_PROMPT = """Ты — модуль извлечения фактов дл�
 
 class ExtractionError(Exception):
     """Raised when extraction fails after all retries/fallback attempts."""
-
 
 class _InvalidJsonError(Exception):
     """LLM returned content that could not be parsed/validated."""
@@ -280,16 +292,20 @@ class ExtractionService:
         tokens_out: int | None,
         usage: dict[str, Any] | None = None,
     ) -> float | None:
-        # Free models on OpenRouter always cost nothing.
-        if model.endswith(":free"):
-            return 0.0
-        # Prefer the provider-reported cost when present.
+        # Prefer the provider-reported cost whenever it is present — that is the
+        # only number that is not a guess (FIX-11). A ``:free`` model reports 0.0
+        # here as well, so the branch below is only a fallback for providers that
+        # omit ``usage.cost``.
         usage = usage or {}
         if usage.get("cost") is not None:
             try:
                 return float(usage["cost"])
             except (TypeError, ValueError):
                 pass
+        # Free models on OpenRouter (``…:free`` / the ``openrouter/free`` alias)
+        # cost nothing; this is only reached when the provider sent no cost.
+        if is_free_model(model):
+            return 0.0
         if tokens_in is None or tokens_out is None:
             return None
         price = PRICING.get(model)

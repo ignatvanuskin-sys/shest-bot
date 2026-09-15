@@ -10,6 +10,7 @@ from __future__ import annotations
 from aiogram.utils.markdown import html_decoration
 
 from app.bot.premium import emoji
+from app.config import sheet_public_url
 from app.models import Lead
 from app.schemas.extraction import ExtractionResult
 
@@ -21,6 +22,19 @@ def _fmt(value) -> str:
 def _q(value) -> str:
     """Escape a dynamic value for HTML output."""
     return html_decoration.quote(str(value))
+
+
+def sheet_link_html(settings, label: str = "открыть таблицу") -> str:
+    """Clickable link to the sheet, or "" when no URL is configured (FIX-15).
+
+    Every message carrying it is sent with ``parse_mode=HTML``; the URL is escaped
+    for the ``href`` attribute, so a hand-written ``SHEET_PUBLIC_URL`` cannot break
+    the message.
+    """
+    url = sheet_public_url(settings)
+    if not url:
+        return ""
+    return f'<a href="{html_decoration.quote(url)}">{html_decoration.quote(label)}</a>'
 
 
 def render_card(data: ExtractionResult) -> str:

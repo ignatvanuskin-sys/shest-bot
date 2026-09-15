@@ -47,6 +47,9 @@ BASE_DATE = 1_700_000_000
 # A premium (custom) emoji looks like <tg-emoji emoji-id="123">✅</tg-emoji>.
 TG_EMOJI_RE = re.compile(r'<tg-emoji emoji-id="(\d+)">(.*?)</tg-emoji>')
 
+# Links the bot is allowed to emit (settings / «строка готова» messages).
+LINK_RE = re.compile(r'</?a(?:\s[^>]*)?>')
+
 # Ranges that cover every plain emoji the bot used before the premium ones
 # (✅ U+2705, ❌ U+274C, ✏ U+270F, ⏰ U+23F0, 👋/📊/… U+1F000+). Deliberately
 # excludes U+2000–U+206F so «» — … and → in Russian copy are not false positives.
@@ -101,12 +104,16 @@ def find_plain_emoji(text: str) -> list[str]:
 
 
 def find_raw_angles(text: str) -> list[str]:
-    """``<``/``>`` left over once premium-emoji tags are removed.
+    """``<``/``>`` left over once real markup tags are removed.
 
     Any leftover angle bracket means user data reached an HTML message
-    unescaped — i.e. Telegram would answer 400 "can't parse entities".
+    unescaped — i.e. Telegram would answer 400 "can't parse entities". Allowed
+    tags are stripped first: ``<tg-emoji>`` (premium emoji) and the ``<a>`` link
+    the settings/row-ready messages carry. Hostile input cannot fake them — it is
+    escaped into ``&lt;a …&gt;`` before it reaches the message.
     """
-    return [char for char in TG_EMOJI_RE.sub("", text) if char in "<>"]
+    without_tags = LINK_RE.sub("", TG_EMOJI_RE.sub("", text))
+    return [char for char in without_tags if char in "<>"]
 
 
 def assert_valid_telegram_html(text: str) -> None:

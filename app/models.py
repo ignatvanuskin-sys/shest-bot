@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -24,6 +24,9 @@ class Lead(Base):
     city: Mapped[str | None] = mapped_column(Text, nullable=True)
     address: Mapped[str | None] = mapped_column(Text, nullable=True)
     phone: Mapped[str | None] = mapped_column(Text, nullable=True)  # normalized E.164
+    # The *original* spelling of the phone as it came from the source (ТЗ §7) —
+    # kept so the normalization can be audited after the fact.
+    phone_raw: Mapped[str | None] = mapped_column(Text, nullable=True)
     whatsapp_number: Mapped[str | None] = mapped_column(Text, nullable=True)
     email: Mapped[str | None] = mapped_column(Text, nullable=True)
     instagram: Mapped[str | None] = mapped_column(Text, nullable=True)  # without @
@@ -60,6 +63,7 @@ class Lead(Base):
             "city",
             "address",
             "phone",
+            "phone_raw",
             "whatsapp_number",
             "email",
             "instagram",

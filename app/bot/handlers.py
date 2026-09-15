@@ -15,6 +15,7 @@ from aiogram.types import CallbackQuery, Message
 from aiogram.utils.markdown import html_decoration
 
 from app.bot import flow
+from app.bot.cards import sheet_link_html
 from app.bot.keyboards import (
     CB_ADD,
     CB_CANCEL,
@@ -32,6 +33,7 @@ from app.bot.premium import emoji
 from app.bot.safe import safe_answer_callback, safe_reply
 from app.bot.states import LeadForm
 from app.schemas.extraction import ExtractionResult
+from app.services.lead_service import describe_cost
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +166,11 @@ async def cmd_stats(message: Message, container) -> None:
         f"• Лидов всего: {stats['total']}\n"
         f"• За неделю: {stats['week']}\n"
         f"• Объединено дублей: {stats['duplicates']}\n"
-        f"• Расход на AI: ${stats['cost_usd']:.6f}",
+        f"• Обращений к AI: {stats['extractions']} "
+        f"(успешных: {stats['extractions_ok']})\n"
+        f"• Токены: {stats['tokens_in']} вх. / {stats['tokens_out']} исх.\n"
+        f"• Расход на AI: "
+        f"{describe_cost(stats['cost_usd'], stats['extractions'], stats['free_extractions'])}",
         action="stats",
         parse_mode=ParseMode.HTML,
     )
@@ -179,17 +185,21 @@ async def cmd_undo(message: Message, container) -> None:
 @router.message(Command("settings"))
 async def cmd_settings(message: Message, container) -> None:
     settings = container.settings
-    sheet_link = (
-        f"https://docs.google.com/spreadsheets/d/{settings.GOOGLE_SHEET_ID}"
-        if settings.GOOGLE_SHEET_ID
-        else "не задана"
+    # FIX-15: a real link when one is configured (SHEET_PUBLIC_URL or the sheet id),
+    # otherwise the honest «не задана».
+    sheet_link = sheet_link_html(settings) or "не задана"
+    # FIX-16: report the actual switch instead of a hardcoded «включены».
+    duplicates = (
+        "включены"
+        if getattr(settings, "DUP_NOTIFICATIONS_ENABLED", True)
+        else "выключены"
     )
     await safe_reply(
         message,
         f"{emoji('settings')} Настройки:\n"
         f"• Город по умолчанию: {html_decoration.quote(str(settings.DEFAULT_CITY))}\n"
-        f"• Уведомления о дублях: включены\n"
-        f"• Таблица: {html_decoration.quote(sheet_link)}\n\n"
+        f"• Уведомления о дублях: {duplicates}\n"
+        f"• Таблица: {sheet_link}\n\n"
         "Значения задаются через переменные окружения (.env).",
         action="settings",
         parse_mode=ParseMode.HTML,

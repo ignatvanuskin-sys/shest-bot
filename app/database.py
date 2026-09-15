@@ -40,16 +40,10 @@ def create_engine_and_sessionmaker(url: str | None = None):
     return engine, session_factory
 
 
-# Module-level defaults used by the application runtime.
-engine, SessionFactory = create_engine_and_sessionmaker()
-
-
-async def get_session() -> AsyncSession:
-    """FastAPI-style dependency yielding a DB session."""
-    async with SessionFactory() as session:
-        yield session
-
-
+# NOTE: there are deliberately no module-level ``engine``/``SessionFactory`` here.
+# Importing this module used to open a second engine on the real database URL that
+# nothing ever disposed (FIX-18); the application builds its own through
+# ``app.di.Container`` and Alembic builds its own in ``alembic/env.py``.
 def run_migrations() -> None:
     """Run Alembic migrations programmatically (idempotent on startup)."""
     from alembic import command

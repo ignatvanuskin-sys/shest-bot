@@ -63,6 +63,15 @@ def read_tables(db_path) -> set[str]:
     return {row[0] for row in rows}
 
 
+def read_columns(db_path, table: str) -> set[str]:
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    finally:
+        conn.close()
+    return {row[1] for row in rows}
+
+
 def assert_schema_created(db_path) -> None:
     tables = read_tables(db_path)
     missing = EXPECTED_TABLES - tables
@@ -73,7 +82,7 @@ def assert_schema_created(db_path) -> None:
         versions = conn.execute("SELECT version_num FROM alembic_version").fetchall()
     finally:
         conn.close()
-    assert [row[0] for row in versions] == ["0001"]
+    assert [row[0] for row in versions] == ["0002"], "migrations must reach the head revision"
 
 
 async def test_run_migrations_async_inside_running_loop(tmp_database_url):
@@ -124,6 +133,28 @@ async def test_startup_runtime_migrates_inside_running_loop(tmp_database_url):
     await startup_runtime(container)
 
     assert_schema_created(db_path)
+
+
+async def test_migration_0002_adds_phone_raw_backward_compatibly(tmp_database_url):
+    """FIX-11: ``leads.phone_raw`` must arrive as a *nullable* column.
+
+    Adding it may not touch a single existing row: the audit trail (ТЗ §7) is
+    additive and old rows simply have no raw spelling recorded.
+    """
+    _, db_path = tmp_database_url
+    await run_migrations_async()
+
+    columns = read_columns(db_path, "leads")
+    assert "phone_raw" in columns, "migration 0002 did not add leads.phone_raw"
+
+    conn = sqlite3.connect(db_path)
+    try:
+        info = {row[1]: row for row in conn.execute("PRAGMA table_info(leads)")}
+    finally:
+        conn.close()
+    # row = (cid, name, type, notnull, dflt_value, pk)
+    assert info["phone_raw"][3] == 0, "phone_raw must stay nullable for existing rows"
+    assert info["phone_raw"][4] is None, "phone_raw needs no server default"
 
 
 async def test_migrations_do_not_disable_app_loggers(tmp_database_url):

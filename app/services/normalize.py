@@ -29,6 +29,23 @@ def digits_only(value: str | None) -> str:
     return re.sub(r"\D", "", str(value))
 
 
+# Escape character for LIKE/ILIKE patterns. ``\`` is the escape character; the
+# callers must pass the same value to ``ilike(..., escape=LIKE_ESCAPE)``.
+LIKE_ESCAPE = "\\"
+
+
+def escape_like(value: str) -> str:
+    """Escape LIKE wildcards so user input is matched literally (FIX-17).
+
+    Without this a search for ``100%`` matched every lead (``%`` is a wildcard),
+    and ``_`` matched any single character.
+    """
+    text = "" if value is None else str(value)
+    for char in (LIKE_ESCAPE, "%", "_"):
+        text = text.replace(char, LIKE_ESCAPE + char)
+    return text
+
+
 def normalize_phone(raw: str | None) -> str | None:
     """Normalize a phone number to E.164 (default region KZ). Returns None if invalid."""
     if not raw:

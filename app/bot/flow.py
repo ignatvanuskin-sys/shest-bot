@@ -9,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.utils.markdown import html_decoration
 from pydantic import ValidationError
 
-from app.bot.cards import render_card, render_lead_summary
+from app.bot.cards import render_card, render_lead_summary, sheet_link_html
 from app.bot.keyboards import collecting_keyboard, duplicate_keyboard, review_keyboard
 from app.bot.premium import emoji
 from app.bot.safe import notify
@@ -564,10 +564,13 @@ async def sync_and_notify(container, lead_id: int, chat_id: int) -> None:
         row = await container.sheets.sync_lead(lead)
         if row:
             await container.leads.update_lead(lead_id, sheet_row=row)
+            # FIX-15: link straight to the table when one is configured.
+            link = sheet_link_html(container.settings)
             await notify(
                 container,
                 chat_id,
-                f"{emoji('row')} Строка #{row} в таблице готова.",
+                f"{emoji('row')} Строка #{row} в таблице готова."
+                + (f" {link}" if link else ""),
                 action="sync_row_ready",
                 parse_mode=ParseMode.HTML,
             )

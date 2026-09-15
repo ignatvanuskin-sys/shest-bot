@@ -41,7 +41,10 @@ class Container:
             primary_model=self.settings.OPENROUTER_MODEL,
             fallback_model=self.settings.OPENROUTER_FALLBACK_MODEL,
         )
-        self.dedup = DedupService(self.session_factory)
+        self.dedup = DedupService(
+            self.session_factory,
+            candidate_limit=self.settings.DEDUP_CANDIDATE_LIMIT,
+        )
         self.sheets = build_sheets_service(self.settings)
 
     def warn_missing_secrets(self) -> None:

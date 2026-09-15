@@ -1,3 +1,5 @@
 -r requirements.txt
-pytest>=8.2,<9
-pytest-asyncio>=0.23,<1
+# Pinned exactly like the runtime set (FIX-20): the suite must run against the same
+# test tooling everywhere.
+pytest==8.4.2
+pytest-asyncio==0.26.0

@@ -5,15 +5,19 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
 from app.bot.dispatcher import feed_update, set_webhook, setup_dispatcher
 from app.config import get_settings
 from app.database import run_migrations_async
 from app.di import build_container
-from app.logging_config import setup_logging
+from app.logging_config import log_json, setup_logging
 from app.services.background import start_background_workers
 from app.services.startup import reconcile_hung_sessions
 
@@ -117,8 +121,25 @@ async def health() -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
+@app.exception_handler(RequestValidationError)
+async def bad_request(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """A body FastAPI cannot even parse must not become a 5xx for Telegram.
+
+    The webhook answers 200 with a log line: the update is unrecognisable, so a
+    Telegram retry would deliver exactly the same unparseable body again (FIX-19).
+    Any other route keeps the normal 422.
+    """
+    if request.url.path == WEBHOOK_PATH:
+        log_json(
+            logger, 30, "webhook body is not valid JSON — ignored",
+            action="webhook_bad_body",
+        )
+        return JSONResponse({"ok": True, "ignored": "unrecognised payload"})
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
+
+
 @app.post("/webhook")
-async def webhook(update: dict, request: Request) -> JSONResponse:
+async def webhook(update: Any, request: Request) -> JSONResponse:
     container = _container
     if container is None:
         raise HTTPException(status_code=503, detail="not initialised")
@@ -129,8 +150,26 @@ async def webhook(update: dict, request: Request) -> JSONResponse:
 
     from aiogram.types import Update
 
+    # A well-formed JSON body that is not a Telegram update (unknown shape, garbage
+    # ids, a bare string/list) is not an internal error: answer 200 so Telegram does
+    # not replay it for ever, and leave a trace in the log (FIX-19).
+    if not isinstance(update, dict):
+        log_json(
+            logger, 30, "webhook body is not an update object — ignored",
+            action="webhook_bad_payload", body_type=type(update).__name__,
+        )
+        return JSONResponse({"ok": True, "ignored": "unrecognised payload"})
     try:
-        await feed_update(container, Update.model_validate(update))
+        parsed = Update.model_validate(update)
+    except ValidationError as exc:
+        log_json(
+            logger, 30, "webhook payload is not a valid Telegram update — ignored",
+            action="webhook_bad_payload", reason=str(exc)[:300],
+        )
+        return JSONResponse({"ok": True, "ignored": "unrecognised payload"})
+
+    try:
+        await feed_update(container, parsed)
     except Exception:
         logger.exception("webhook update handling failed")
         raise HTTPException(status_code=500, detail="internal")

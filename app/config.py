@@ -51,6 +51,23 @@ class Settings(BaseSettings):
     # Seconds between passes; 0 or less switches the worker off.
     AUTO_RESYNC_INTERVAL_SECONDS: float = 300.0
 
+    # Timezone used to *display* timestamps (the sheet's «Дата добавления» /
+    # «Дата последнего контакта» columns). The database always keeps UTC; only the
+    # human-facing text is shifted, otherwise a UTC+5 owner sees times 5 h in the past.
+    DISPLAY_TIMEZONE: str = "Asia/Almaty"
+
+    # Public link to the shared sheet, shown in /settings and after a lead is added.
+    # Empty (default) = no link is offered; it is never invented.
+    SHEET_PUBLIC_URL: str = ""
+
+    # Duplicate notifications shown by /settings. This is the real switch the bot
+    # reports — the text used to claim «включены» unconditionally.
+    DUP_NOTIFICATIONS_ENABLED: bool = True
+
+    # How many existing leads one dedup lookup may pull out of SQLite (see
+    # DedupService). Bounds the in-memory comparison for a large base.
+    DEDUP_CANDIDATE_LIMIT: int = 500
+
     @property
     def allowed_user_ids(self) -> set[int]:
         """Parsed allowlist as a set of ints."""
@@ -86,3 +103,19 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def sheet_public_url(settings) -> str:
+    """Public link to the shared sheet, or "" when there is none to show (FIX-15).
+
+    ``SHEET_PUBLIC_URL`` wins; otherwise the spreadsheet URL is derived from
+    ``GOOGLE_SHEET_ID`` (path A). Nothing is invented: with neither set, the bot
+    simply says the table is not configured.
+    """
+    explicit = (getattr(settings, "SHEET_PUBLIC_URL", "") or "").strip()
+    if explicit:
+        return explicit
+    sheet_id = (getattr(settings, "GOOGLE_SHEET_ID", "") or "").strip()
+    if sheet_id:
+        return f"https://docs.google.com/spreadsheets/d/{sheet_id}"
+    return ""
