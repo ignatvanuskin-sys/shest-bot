@@ -34,6 +34,7 @@ from app.config import get_settings
 from app.database import run_migrations_async
 from app.di import Container
 from app.models import Lead, LeadSession
+from app.services.sheets import BaseSheetsSyncService
 
 # A real-looking token; aiogram validates "<digits>:<non-empty>".
 TEST_BOT_TOKEN = "123456:TEST-TOKEN-FOR-INTEGRATION-TESTS"
@@ -256,16 +257,40 @@ class ScriptedExtraction:
         return None
 
 
-class RecordingSheets:
-    """Fake sheets backend: records synced leads, returns a scripted row."""
+class RecordingSheets(BaseSheetsSyncService):
+    """Fake sheets backend: records synced leads, returns a scripted row.
+
+    Subclassing the production service (instead of replacing ``sync_lead`` with a
+    stub) keeps two behaviours on the integration path: the refusal to mirror a
+    merged/deleted row, and the ``sheet_row`` → append-vs-update decision. Losing
+    that decision is how a merge ended up writing a second line, so tests assert on
+    ``appends``/``updates``, not just on "something was synced".
+
+    ``row = None`` simulates an unavailable sheet: the write is reported as a
+    failure and the lead stays unsynced.
+    """
 
     def __init__(self, row: int | None = 7):
+        super().__init__()
         self.row = row
         self.synced: list[Lead] = []
+        self.appends: list[list] = []
+        self.updates: list[tuple[int, list]] = []
+
+    @property
+    def configured(self) -> bool:
+        return True
+
+    async def _append(self, values: list) -> int | None:
+        self.appends.append(values)
+        return self.row
+
+    async def _update(self, row: int, values: list) -> None:
+        self.updates.append((row, values))
 
     async def sync_lead(self, lead):
         self.synced.append(lead)
-        return self.row
+        return await super().sync_lead(lead)
 
     async def close(self):
         return None

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -87,7 +88,13 @@ class FakeLeads:
         self.raw.append(text)
 
     async def add_lead(self, uid, data, sid=None, merge_target_id=None, prefer_new_contact=False):
-        lead = SimpleNamespace(id=self._lid)
+        # Mirrors LeadService: a merge returns the *duplicate* row, already marked dead.
+        lead = SimpleNamespace(
+            id=self._lid,
+            duplicate_of_id=merge_target_id,
+            deleted_at=datetime.now(timezone.utc) if merge_target_id else None,
+            sheet_row=None,
+        )
         self._lid += 1
         self.leads[lead.id] = lead
         return lead

@@ -29,6 +29,17 @@ class SheetsError(Exception):
     """Raised when a sync ultimately fails (lead stays in SQLite)."""
 
 
+def is_syncable(lead: Lead) -> bool:
+    """Whether *lead* may be mirrored into the sheet at all.
+
+    A merge (``LeadService.add_lead(merge_target_id=...)``) keeps the incoming data
+    as a row marked ``duplicate_of_id`` + ``deleted_at``. That row never had a
+    ``sheet_row``, so mirroring it *appends* a second line for a company already in
+    the table. Only live rows own a sheet line.
+    """
+    return lead.deleted_at is None and lead.duplicate_of_id is None
+
+
 def escape_sheet_value(value) -> str:
     """Protect against formula injection; flatten None → empty string."""
     if value is None:
@@ -102,6 +113,17 @@ class BaseSheetsSyncService:
 
     async def sync_lead(self, lead: Lead) -> int | None:
         """Append or update a lead. Returns the sheet row number, or None on failure."""
+        if not is_syncable(lead):
+            # Merged/deleted rows are audit history only. Syncing one would append a
+            # duplicate line (no sheet_row) or overwrite a live row with stale data.
+            log_json(
+                logger, 30, "sheets sync refused (lead is merged or deleted)",
+                lead_id=lead.id, action="sheets_sync_refused",
+                duplicate_of_id=lead.duplicate_of_id,
+                deleted=lead.deleted_at is not None,
+            )
+            return None
+
         if not self.configured:
             log_json(logger, 30, "sheets sync skipped (not configured)", lead_id=lead.id)
             return None

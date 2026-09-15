@@ -15,6 +15,7 @@ from app.bot.premium import emoji
 from app.bot.safe import notify
 from app.bot.states import LeadForm
 from app.logging_config import set_session_id
+from app.models import Lead
 from app.schemas.extraction import ExtractionResult
 from app.services.dedup import fingerprint_from_extraction
 from app.services.extraction import ExtractionError
@@ -175,7 +176,8 @@ async def finalize_collection(container, user_id: int, chat_id: int, state: FSMC
         lead = await container.leads.add_lead(
             user_id, extracted, session_id, merge_target_id=match.lead_id
         )
-        asyncio.create_task(sync_and_notify(container, lead.id, chat_id))
+        # ``lead`` is the dead duplicate row; the merged values live on the target.
+        asyncio.create_task(sync_and_notify(container, merge_sync_target(lead), chat_id))
         await state.clear()
         await notify(
             container,
@@ -287,7 +289,8 @@ async def handle_duplicate_choice(
         user_id, extracted, session_id,
         merge_target_id=existing_id, prefer_new_contact=prefer_new_contact,
     )
-    asyncio.create_task(sync_and_notify(container, lead.id, chat_id))
+    # Same as the auto-merge branch: only the live target has a sheet_row to update.
+    asyncio.create_task(sync_and_notify(container, merge_sync_target(lead), chat_id))
     await state.clear()
     await notify(
         container,
@@ -389,6 +392,17 @@ def apply_edit(data: dict, field: str, value: str) -> dict:
     else:
         data[field] = value
     return data
+
+
+def merge_sync_target(lead: Lead) -> int:
+    """Id of the row that owns the sheet line after a merge.
+
+    ``LeadService.add_lead(merge_target_id=...)`` returns the *duplicate* row: it is
+    immediately marked ``duplicate_of_id``/``deleted_at`` and has no ``sheet_row``.
+    Syncing it appends a second line for a company already in the table, while the
+    real lead's row keeps the pre-merge values. Only the merge target must be synced.
+    """
+    return lead.duplicate_of_id or lead.id
 
 
 async def sync_and_notify(container, lead_id: int, chat_id: int) -> None:

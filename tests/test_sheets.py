@@ -1,7 +1,8 @@
 """Google Sheets sync tests (escape + row mapping + append/update/retry via mocks)."""
 from __future__ import annotations
 
-from datetime import datetime
+import logging
+from datetime import datetime, timezone
 
 import pytest
 
@@ -10,6 +11,7 @@ from app.services import sheets as sheets_mod
 from app.services.sheets import (
     SheetsSyncService,
     escape_sheet_value,
+    is_syncable,
     lead_to_row_values,
 )
 
@@ -101,3 +103,54 @@ async def test_sync_retries_then_gives_up(monkeypatch):
     assert row is None
     assert attempts["n"] == 3
     assert lead.sheet_row is None
+
+
+# ---------------- merged/deleted rows never reach the sheet ----------------
+#
+# Regression: after a dedup merge the bot synced the *duplicate* row. That row has no
+# sheet_row, so the sync appended a second line for a company already in the table.
+# The service now refuses such rows outright, whatever the caller passes in.
+
+_DEAD_ROW_SHAPES = {
+    "merged": {"duplicate_of_id": 1, "deleted_at": datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)},
+    "deleted": {"deleted_at": datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)},
+    "merged_without_timestamp": {"duplicate_of_id": 1},
+}
+
+
+def test_is_syncable_only_for_live_rows():
+    assert is_syncable(models.Lead(id=1)) is True
+    assert is_syncable(models.Lead(id=2, **(_DEAD_ROW_SHAPES["merged"]))) is False
+    assert is_syncable(models.Lead(id=3, **(_DEAD_ROW_SHAPES["deleted"]))) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", sorted(_DEAD_ROW_SHAPES))
+async def test_sync_refuses_merged_or_deleted_rows(shape, monkeypatch, caplog):
+    svc = SheetsSyncService("sheetid", "e30=")
+    lead = models.Lead(id=2, **_DEAD_ROW_SHAPES[shape])
+    appends: list = []
+    updates: list = []
+
+    async def fake_append(values):
+        appends.append(values)
+        return 5
+
+    async def fake_update(row, values):
+        updates.append((row, values))
+
+    monkeypatch.setattr(svc, "_append", fake_append)
+    monkeypatch.setattr(svc, "_update", fake_update)
+
+    with caplog.at_level(logging.WARNING, logger="app.services.sheets"):
+        row = await svc.sync_lead(lead)
+
+    assert row is None, "a refused sync must report failure, not a row"
+    assert appends == [], "a dead row must never be appended"
+    assert updates == [], "a dead row must never overwrite a live row"
+    assert lead.sheet_row is None
+
+    refusals = [r for r in caplog.records if getattr(r, "action", None) == "sheets_sync_refused"]
+    assert refusals, "the refusal must be logged (action=sheets_sync_refused)"
+    assert "merged or deleted" in refusals[0].getMessage()
+    assert refusals[0].lead_id == 2
