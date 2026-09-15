@@ -5,6 +5,7 @@ import logging
 
 from aiogram.types import Update
 
+from app.bot.errors import handle_update_error
 from app.bot.handlers import router
 from app.bot.middlewares import AllowlistMiddleware, RetryMiddleware
 
@@ -18,6 +19,11 @@ def setup_dispatcher(container) -> None:
     # Order: outer retry, then allowlist (innermost runs last).
     dp.update.middleware(RetryMiddleware(max_retries=3))
     dp.update.middleware(AllowlistMiddleware(container))
+
+    # Any exception escaping handlers/middlewares is logged with full context and
+    # reported as handled, so the webhook answers 200 instead of 500 (Telegram
+    # re-delivers every non-2xx response — that was the prod retry storm).
+    dp.errors.register(handle_update_error)
 
     dp.include_router(router)
     logger.info("dispatcher configured")

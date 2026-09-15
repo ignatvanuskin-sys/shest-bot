@@ -15,9 +15,6 @@ carry a custom-emoji icon with a clean, emoji-free label.
 """
 from __future__ import annotations
 
-import socket
-
-import pytest
 from aiogram.enums import ParseMode
 
 from app.bot.keyboards import CB_ADD, CB_CANCEL, CB_DONE, CB_DUP_NEW, CB_EDIT, CB_EDIT_DONE
@@ -32,31 +29,9 @@ from tests.integration_harness import (
     has_plain_emoji,
     harness,  # noqa: F401  — imported fixture
     iter_buttons,
+    no_network,  # noqa: F401  — autouse imported fixture (blocks non-loopback sockets)
     wait_until,
 )
-
-
-@pytest.fixture(autouse=True)
-def no_network(monkeypatch):
-    """Fail loudly if any test path tries to talk to the outside world.
-
-    Loopback is allowed because the Windows event loop builds its self-pipe via
-    ``socket.socketpair()`` (a loopback TCP connection); everything else raises.
-    """
-    real_connect = socket.socket.connect
-    loopback = {"127.0.0.1", "::1", "localhost", "0.0.0.0"}
-
-    def guarded_connect(self, address, *args, **kwargs):
-        host = address[0] if isinstance(address, tuple) else address
-        if host in loopback:
-            return real_connect(self, address, *args, **kwargs)
-        raise AssertionError(f"network connection attempted: {address!r}")
-
-    def blocked_create_connection(*args, **kwargs):
-        raise AssertionError("network access attempted via socket.create_connection")
-
-    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
-    monkeypatch.setattr(socket, "create_connection", blocked_create_connection)
 
 
 def full_result() -> ExtractionResult:

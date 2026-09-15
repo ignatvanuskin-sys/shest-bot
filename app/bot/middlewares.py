@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import suppress
 
 from aiogram import BaseMiddleware
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
@@ -15,6 +14,7 @@ from aiogram.types import (
     TelegramObject,
     Update,
 )
+from app.bot.safe import safe_answer_callback, safe_send
 from app.logging_config import log_json
 
 logger = logging.getLogger(__name__)
@@ -90,10 +90,23 @@ class AllowlistMiddleware(BaseMiddleware):
                     logger, 20, "blocked: unknown user",
                     telegram_user_id=user_id, action="allowlist_blocked",
                 )
-            await self._container.bot.send_message(user_id, "Это приватный бот.")
+            # The neutral reply must not fail the update either (prod: chat not
+            # found → 500 → Telegram retried the blocked user's updates).
+            await safe_send(
+                self._container.bot.send_message(user_id, "Это приватный бот."),
+                action="allowlist_reply",
+                chat_id=user_id,
+                user_id=user_id,
+            )
         if isinstance(user_event, CallbackQuery):
-            with suppress(Exception):
-                await self._container.bot.answer_callback_query(user_event.id)
+            # notify_stale=False: a blocked user gets the neutral reply above and
+            # nothing else — the «Карточка устарела» notice is for allowlisted users.
+            await safe_answer_callback(
+                user_event,
+                action="allowlist_callback_ack",
+                bot=self._container.bot,
+                notify_stale=False,
+            )
         return
 
 
