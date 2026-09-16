@@ -29,6 +29,17 @@ OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 # which is why the reported value wins over this predicate (FIX-11).
 FREE_MODEL_SUFFIXES = (":free", "/free")
 
+# HTTP statuses that mean «quota/credit exhausted», not «provider is down»:
+# OpenRouter sends 429 for a rate/daily limit and 402 when no credit is left.
+# They share one path — a retry with the same key cannot succeed.
+QUOTA_STATUS_CODES = frozenset({429, 402})
+
+# Attempts on the *primary* model before the fallback: one try + one retry.
+# Deliberately small — the models answer in 15–40 s, so a longer chain would keep
+# the user waiting while the provider is down. A quota refusal skips this entirely
+# (see ``ExtractionService.extract``).
+PRIMARY_ATTEMPTS = 2
+
 # ТЗ §11: the full answer of the model is DEBUG-level data. It goes into
 # ``extraction_logs.response_body`` (never into the stdout logs — a JSON log line
 # carrying a 4 kB answer is unreadable and would be shipped off the box) and is
@@ -56,6 +67,19 @@ def is_free_model(model: str | None) -> bool:
     if not model:
         return False
     return str(model).strip().lower().endswith(FREE_MODEL_SUFFIXES)
+
+
+def model_provider(model: str | None) -> str:
+    """Vendor part of an OpenRouter model id (``nvidia/nemotron…`` → ``nvidia``).
+
+    Used only to decide whether the fallback model is worth one attempt after the
+    primary was refused for quota reasons: asking the same vendor through the same
+    account would be refused again.
+    """
+    name = (model or "").strip().lower()
+    if not name:
+        return ""
+    return name.split("/", 1)[0]
 
 # Approximate pricing (USD per 1 token) for non-:free models, used only as a
 # fallback when the API response does not include ``usage.cost``.
@@ -137,12 +161,41 @@ SYSTEM_PROMPT = """Ты — модуль извлечения фактов дл�
 class ExtractionError(Exception):
     """Raised when extraction fails after all retries/fallback attempts."""
 
+
+class AIQuotaExceededError(ExtractionError):
+    """Extraction impossible because the AI quota/credit is used up, not down.
+
+    OpenRouter answers **429** when a (for the free tier: the ~50 requests/day)
+    limit is exhausted and **402** when the account has no credit left. Neither is
+    an outage: the same key will be refused again in five seconds as well, so the
+    retry → fallback chain is pointless there. The flow catches this subclass
+    specifically to say *why* and offer manual entry instead of the generic
+    «не удалось распознать».
+    """
+
+    def __init__(
+        self, message: str, *, status_code: int | None = None, model: str | None = None
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.model = model
+
+
 class _InvalidJsonError(Exception):
     """LLM returned content that could not be parsed/validated."""
 
 
 class _UnavailableError(Exception):
     """LLM provider unreachable / timeout / non-2xx."""
+
+
+class _QuotaError(Exception):
+    """Internal: one attempt was refused with 429/402 (carries status + model)."""
+
+    def __init__(self, message: str, *, status_code: int, model: str):
+        super().__init__(message)
+        self.status_code = status_code
+        self.model = model
 
 
 def _extract_json_object(content: str) -> dict[str, Any]:
@@ -204,26 +257,33 @@ class ExtractionService:
         await self._client.aclose()
 
     async def extract(self, text: str, session_id: int | None = None) -> ExtractionResult:
-        """Run extraction with retry + model fallback. Raises ExtractionError if all fail."""
+        """Run extraction with retry + model fallback. Raises ``ExtractionError`` if all fail.
+
+        Two failure families, deliberately kept apart:
+
+        * **outage** (network error, 5xx, malformed 200 body) → the pre-existing
+          chain: primary, one retry on the primary, then the fallback model;
+        * **quota** (429/402) → the same key will be refused again, so the primary
+          is *not* retried; the fallback gets one attempt, and only when it is a
+          different provider (otherwise it is the same refusal). The caller then
+          gets :class:`AIQuotaExceededError` and can explain the situation.
+        """
         if not self.api_key:
             raise ExtractionError("OPENROUTER_API_KEY не задан")
 
-        attempts: list[tuple[str, str | None]] = [
-            (self.primary_model, None),
-            (self.primary_model, None),  # one retry on the same provider
-            (self.fallback_model, None),
-        ]
-        error_note: str | None = None
         last_error: Exception | None = None
+        error_note: str | None = None
+        quota: _QuotaError | None = None
 
-        for model, _ in attempts:
+        for _ in range(PRIMARY_ATTEMPTS):
             try:
-                result = await self._attempt(model, text, session_id, error_note)
-                log_json(
-                    logger, 20, "extraction succeeded",
-                    session_id=session_id, model=model, success=True,
-                )
-                return result
+                return await self._run_attempt(self.primary_model, text, session_id, error_note)
+            except _QuotaError as exc:
+                # Do not repeat: same model, same key, same refusal. Leave the loop
+                # with the status/model of the refusal so the error below can carry it.
+                quota = exc
+                last_error = exc
+                break
             except _InvalidJsonError as exc:
                 last_error = exc
                 error_note = str(exc)  # retry with the exact validation error
@@ -231,7 +291,53 @@ class ExtractionService:
                 last_error = exc
                 error_note = None
 
+        if self._fallback_is_worth_trying(quota):
+            try:
+                return await self._run_attempt(
+                    self.fallback_model, text, session_id, error_note
+                )
+            except _QuotaError as exc:
+                quota = exc
+                last_error = exc
+            except (_InvalidJsonError, _UnavailableError) as exc:
+                last_error = exc
+
+        if quota is not None:
+            raise AIQuotaExceededError(
+                f"AI-лимит исчерпан (HTTP {quota.status_code}, {quota.model}): {quota}",
+                status_code=quota.status_code,
+                model=quota.model,
+            )
         raise ExtractionError(f"извлечение не удалось: {last_error}")
+
+    def _fallback_is_worth_trying(self, quota: _QuotaError | None) -> bool:
+        """Whether the fallback model gets its one attempt.
+
+        After an outage (``quota is None``) it is always attempted — that is the
+        existing fallback half of the chain. After a quota refusal only a fallback
+        from a *different* provider is worth a try; the same provider on the same
+        account would answer 429/402 again. (OpenRouter meters the free tier per
+        account, so even another vendor's ``…:free`` model can be refused — then the
+        raised :class:`AIQuotaExceededError` carries that status.)
+        """
+        if not self.fallback_model:
+            return False
+        if quota is None:
+            return True
+        if self.fallback_model == quota.model:
+            return False
+        return model_provider(self.fallback_model) != model_provider(quota.model)
+
+    async def _run_attempt(
+        self, model: str, text: str, session_id: int | None, error_note: str | None
+    ) -> ExtractionResult:
+        """One model call, with the success line logged for the attempt chain."""
+        result = await self._attempt(model, text, session_id, error_note)
+        log_json(
+            logger, 20, "extraction succeeded",
+            session_id=session_id, model=model, success=True,
+        )
+        return result
 
     async def _attempt(
         self, model: str, text: str, session_id: int | None, error_note: str | None
@@ -271,6 +377,20 @@ class ExtractionService:
                 model, session_id, None, None, None, latency, False,
                 response.text[:500], response_body=raw_body,
             )
+            if response.status_code in QUOTA_STATUS_CODES:
+                # Not an outage: the (free-tier) limit or the credit is exhausted, so
+                # re-sending the same request would only burn the same quota again.
+                # The dedicated ``action`` is what separates this event from a real
+                # failure when reading the logs (status + model + why, no body).
+                log_json(
+                    logger, 40, "AI limit reached (429/402) — no retry, manual entry next",
+                    action="ai_limit_reached", session_id=session_id, model=model,
+                    status_code=response.status_code, reason=response.text[:200],
+                )
+                raise _QuotaError(
+                    f"HTTP {response.status_code}: {response.text[:200]}",
+                    status_code=response.status_code, model=model,
+                )
             raise _UnavailableError(f"HTTP {response.status_code}: {response.text[:200]}")
 
         # A 200 with a non-JSON/empty body (HTML error page, truncated stream,

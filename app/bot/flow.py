@@ -18,7 +18,7 @@ from app.logging_config import get_session_id, set_session_id
 from app.models import Lead
 from app.schemas.extraction import ExtractionResult
 from app.services.dedup import fingerprint_from_extraction
-from app.services.extraction import ExtractionError
+from app.services.extraction import AIQuotaExceededError, ExtractionError
 from app.services.lead_service import (
     SESSION_STATUS_CANCELLED,
     SESSION_STATUS_EDITING,
@@ -37,6 +37,18 @@ MANUAL_PROMPTS = {
     "website": f"{emoji('website')} Введите сайт (или «-»):",
     "instagram": f"{emoji('instagram')} Введите Instagram (или «-»):",
 }
+
+# What the user sees when OpenRouter answers 429/402 (the ~50 requests/day free
+# tier or an empty balance). Three facts, in the order that helps: the reason, the
+# way out ($10 → 1000 requests/day), and that nothing is lost meanwhile — the
+# manual-entry wizard starts right after this message. HTML parse mode, so no raw
+# markup may appear here (fixed copy, no interpolation).
+AI_LIMIT_MESSAGE = (
+    f"{emoji('warning')} Дневной лимит бесплатных AI-запросов исчерпан "
+    "(вернётся после 00:00 UTC).\n"
+    "Можно пополнить OpenRouter на $10 — лимит станет 1000 запросов/сутки.\n"
+    "Пока могу принять лид вручную."
+)
 
 # Every field the extraction schema knows; an edit is accepted only for one of them
 # and is always validated. Callback data is user-controlled, so the check cannot live
@@ -242,7 +254,19 @@ async def _finalize_collection(container, user_id: int, chat_id: int, state: FSM
             if not await _still_processing(state):
                 return
             reason = str(exc)
-            if "OPENROUTER_API_KEY" in reason:
+            if isinstance(exc, AIQuotaExceededError):
+                # Quota, not an outage: say what happened and hand over to manual
+                # entry. The typed text stays in the session, so a lead can still be
+                # saved without AI (the wizard starts collecting it below).
+                await notify(
+                    container,
+                    chat_id,
+                    AI_LIMIT_MESSAGE,
+                    action="ai_limit_reached",
+                    user_id=user_id,
+                    parse_mode=ParseMode.HTML,
+                )
+            elif "OPENROUTER_API_KEY" in reason:
                 await notify(
                     container,
                     chat_id,

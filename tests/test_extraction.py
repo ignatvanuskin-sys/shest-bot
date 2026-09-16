@@ -2,20 +2,25 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import httpx
 import pytest
+from sqlalchemy import select
 
+from app.models import RawMessage
 from app.schemas.extraction import ExtractionResult
 from app.services.extraction import (
     FALLBACK_MODEL,
     PRIMARY_MODEL,
+    AIQuotaExceededError,
     ExtractionError,
     ExtractionService,
     _InvalidJsonError,
     parse_extraction_content,
 )
 from tests.integration_harness import (
+    assert_valid_telegram_html,
     harness,  # noqa: F401  — imported fixture
     no_network,  # noqa: F401  — autouse imported fixture (blocks non-loopback sockets)
 )
@@ -101,6 +106,17 @@ def _empty_body() -> _FakeResponse:
 
 def _null_content() -> _FakeResponse:
     return _FakeResponse(content="", data={"choices": [{"message": {"content": None}}]})
+
+
+def _http_error(status: int, body: str | None = None) -> _FakeResponse:
+    """A non-2xx answer. The default body is what OpenRouter sends for its limits."""
+    return _FakeResponse(
+        content=body
+        or json.dumps(
+            {"error": {"message": "rate limit exceeded: free-models-per-day", "code": status}}
+        ),
+        status_code=status,
+    )
 
 
 # ---------------- parsing ----------------
@@ -259,3 +275,170 @@ async def test_non_json_provider_answer_routes_the_user_to_manual_entry(harness)
     assert harness.bot.contains("Не удалось распознать автоматически")
     assert harness.bot.contains("Введите название компании")
     assert await harness.lead_count() == 0
+
+
+# ---------------- daily limit (429 / 402) is not «провайдер упал» ----------------
+# The free OpenRouter tier allows ~50 requests/day and answers 429 once they are
+# used up (402 when the balance is empty). Re-sending the request cannot help, so
+# the outage chain (retry → retry → fallback → «не удалось распознать») must not
+# run: the user is told *why* and the fallback is attempted at most once, and only
+# when it belongs to another provider.
+async def test_quota_429_tries_primary_once_then_another_provider_once():
+    client = _FakeClient([_http_error(429)] * 3)
+    service = ExtractionService("key", _FakeSessionFactory())
+    service._client = client
+
+    with pytest.raises(AIQuotaExceededError) as excinfo:
+        await service.extract("text", session_id=7)
+
+    assert excinfo.value.status_code == 429
+    # The error carries the *last* refusal (the fallback was refused too); the log
+    # has one ``ai_limit_reached`` line per model.
+    assert excinfo.value.model == FALLBACK_MODEL
+    # One primary attempt (no retry) + one fallback attempt (different provider).
+    assert [call["model"] for call in client.calls] == [PRIMARY_MODEL, FALLBACK_MODEL]
+
+
+async def test_quota_402_takes_the_same_path():
+    client = _FakeClient([_http_error(402, '{"error":{"message":"insufficient credits"}}')] * 3)
+    service = ExtractionService("key", _FakeSessionFactory())
+    service._client = client
+
+    with pytest.raises(AIQuotaExceededError) as excinfo:
+        await service.extract("text")
+
+    assert excinfo.value.status_code == 402
+    assert [call["model"] for call in client.calls] == [PRIMARY_MODEL, FALLBACK_MODEL]
+
+
+async def test_quota_does_not_retry_the_primary_model():
+    """Numbers, not prose: the quota path costs exactly one call on the primary."""
+    client = _FakeClient([_http_error(429)] * 3)
+    # A fallback from the *same* provider would be refused for the same reason, so
+    # the whole chain collapses to a single request.
+    service = ExtractionService(
+        "key", _FakeSessionFactory(), fallback_model="openrouter/some-other:free"
+    )
+    service._client = client
+
+    with pytest.raises(AIQuotaExceededError):
+        await service.extract("text")
+
+    assert len(client.calls) == 1, "the primary model was retried despite the 429"
+
+
+async def test_quota_does_not_retry_an_identical_fallback():
+    client = _FakeClient([_http_error(429)] * 3)
+    service = ExtractionService(
+        "key", _FakeSessionFactory(), fallback_model=PRIMARY_MODEL
+    )
+    service._client = client
+
+    with pytest.raises(AIQuotaExceededError):
+        await service.extract("text")
+
+    assert len(client.calls) == 1
+
+
+async def test_quota_on_primary_still_lets_the_fallback_answer():
+    """Degradation, not failure: a different provider may still serve the request."""
+    client = _FakeClient([_http_error(429), _ok('{"company_name": "Fallback Co"}')])
+    service = ExtractionService("key", _FakeSessionFactory())
+    service._client = client
+
+    result = await service.extract("text")
+
+    assert result.company_name == "Fallback Co"
+    assert [call["model"] for call in client.calls] == [PRIMARY_MODEL, FALLBACK_MODEL]
+
+
+async def test_http_503_keeps_the_retry_and_fallback_chain():
+    """An outage must behave exactly as before: retry, then fallback, then error."""
+    client = _FakeClient([_http_error(503)] * 3)
+    service = ExtractionService("key", _FakeSessionFactory())
+    service._client = client
+
+    with pytest.raises(ExtractionError) as excinfo:
+        await service.extract("text")
+
+    assert not isinstance(excinfo.value, AIQuotaExceededError)
+    assert [call["model"] for call in client.calls] == [
+        PRIMARY_MODEL,
+        PRIMARY_MODEL,
+        FALLBACK_MODEL,
+    ]
+
+
+async def test_quota_is_logged_as_its_own_action(caplog):
+    """The limit is greppable and distinguishable from a real provider failure."""
+    client = _FakeClient([_http_error(429)] * 3)
+    service = ExtractionService("key", _FakeSessionFactory())
+    service._client = client
+
+    with caplog.at_level(logging.ERROR, logger="app.services.extraction"):
+        with pytest.raises(AIQuotaExceededError):
+            await service.extract("text", session_id=11)
+
+    limit_records = [r for r in caplog.records if getattr(r, "action", None) == "ai_limit_reached"]
+    assert limit_records, "the limit was not logged with action=ai_limit_reached"
+    first = limit_records[0]
+    assert first.status_code == 429
+    assert first.model == PRIMARY_MODEL
+    assert "free-models-per-day" in first.reason
+    # A genuine outage keeps its own path — no limit action for it.
+    caplog.clear()
+    service._client = _FakeClient([_http_error(503)] * 3)
+    with caplog.at_level(logging.ERROR, logger="app.services.extraction"):
+        with pytest.raises(ExtractionError):
+            await service.extract("text")
+    assert not [r for r in caplog.records if getattr(r, "action", None) == "ai_limit_reached"]
+
+
+async def test_quota_limit_does_not_eat_the_lead(harness):
+    """The user is told about the limit, and the lead is still saveable by hand."""
+    from app.bot.keyboards import CB_ADD
+    from app.bot.states import LeadForm
+
+    text = "ТОО Ромашка, Алматы, +7 700 123 45 67"
+    service = ExtractionService("key", harness.container.session_factory)
+    await service._client.aclose()  # the real httpx client is never used here
+    service._client = _FakeClient([_http_error(429)] * 3)
+    harness.container.extraction = service
+
+    await harness.send_text(text)
+    await harness.send_command("/done")
+
+    # 1. The user gets the reason, not the generic «не удалось распознать», and the
+    #    existing manual-entry scenario follows it.
+    assert await harness.fsm_state() == LeadForm.ManualEntry.state
+    assert harness.bot.contains("Дневной лимит бесплатных AI-запросов исчерпан")
+    assert harness.bot.contains("пополнить OpenRouter")
+    assert harness.bot.contains("Введите название компании")
+    assert not harness.bot.contains("Не удалось распознать автоматически")
+    # The message is sent with parse_mode=HTML (premium emoji), so it must survive
+    # Telegram's parser: no plain emoji outside a tag, no raw angle brackets.
+    limit_notice = next(
+        text for text in harness.bot.texts() if "Дневной лимит" in text
+    )
+    assert_valid_telegram_html(limit_notice)
+
+    # 2. Nothing was lost: no half-saved lead, the dialog is still open (not
+    #    cancelled), the typed text is in the session and in raw_messages.
+    assert await harness.lead_count() == 0
+    sessions = await harness.sessions()
+    assert len(sessions) == 1
+    assert sessions[0].status == "review"
+    assert text in (sessions[0].combined_text or "")
+    async with harness.container.session_factory() as session:
+        stored = (await session.execute(select(RawMessage))).scalars().all()
+    assert any(text in (row.message_text or "") for row in stored)
+
+    # 3. Manual entry works end to end, without any AI call.
+    for answer in ("Ромашка", "+7 700 123 45 67", "Алматы", "-", "-"):
+        await harness.send_text(answer)
+    await harness.tap(CB_ADD)
+
+    leads = await harness.leads()
+    assert len(leads) == 1
+    assert leads[0].company_name == "Ромашка"
+    assert len(service._client.calls) == 2, "the limit path must not keep hammering the API"
