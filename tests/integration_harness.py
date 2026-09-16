@@ -20,10 +20,11 @@ import importlib
 import re
 import socket
 import xml.etree.ElementTree as ElementTree
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from types import SimpleNamespace
 
+import httpx
 import pytest
 import pytest_asyncio
 from aiogram.types import Update
@@ -424,6 +425,92 @@ class DispatcherHarness:
         async with self.container.session_factory() as session:
             result = await session.execute(select(LeadSession).order_by(LeadSession.id))
             return list(result.scalars().all())
+
+
+# ---------------- the real ASGI webhook path ----------------
+#
+# A hand-built ``starlette.requests.Request`` passed straight to the route
+# function is NOT a webhook test: it skips routing, body parsing, dependency
+# solving and the exception handlers, i.e. everything between Telegram's POST and
+# the first line of the handler. That gap is exactly where the prod regression of
+# 2026-09 lived — ``async def webhook(update: Any, request: Request)`` made
+# FastAPI demand ``update`` as a *required query parameter*, so every real POST
+# died in validation before the handler ran, while the route-arg tests stayed
+# green. Everything below drives ``app.main.app`` over ASGI instead.
+
+WEBHOOK_SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token"
+
+#: Default for :func:`post_webhook`'s ``secret``: send whatever the container is
+#: configured with (the local ``.env`` may define ``WEBHOOK_SECRET``). Pass
+#: ``secret=None`` to send no header at all, or a string for a specific value.
+CONFIGURED_SECRET = object()
+
+
+def _container_of(target):
+    """Accept either a ``DispatcherHarness`` or the container itself.
+
+    Tests hold the harness, so ``post_webhook(harness, ...)`` and
+    ``asgi_client(harness)`` both read naturally without a ``.container`` suffix.
+    """
+    return getattr(target, "container", target)
+
+
+@asynccontextmanager
+async def asgi_client(target):
+    """Yield an HTTP client bound to the real FastAPI app, with the container wired in.
+
+    The lifespan is deliberately not run: ``startup_runtime`` would apply Alembic
+    migrations to the configured database and register the Telegram webhook.
+    ``httpx.ASGITransport`` never sends ``lifespan`` scopes, so ``/webhook`` and
+    ``/health`` are served by the same code production serves, minus the startup.
+    """
+    import app.main as main_module
+
+    container = _container_of(target)
+    previous = main_module._container
+    main_module._container = container
+    transport = httpx.ASGITransport(app=main_module.app)
+    try:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            yield client
+    finally:
+        main_module._container = previous
+
+
+async def post_webhook(
+    target,
+    body: bytes | str,
+    *,
+    secret: object = CONFIGURED_SECRET,
+    headers: dict | None = None,
+    query: str = "",
+) -> httpx.Response:
+    """POST a raw *body* to ``app.main.WEBHOOK_PATH`` through the real ASGI app.
+
+    *target* is the harness or the container. *body* is sent verbatim, so a caller
+    can send JSON that does not parse, a bare list, or a bare string. *query* is
+    appended to the path — empty by default, which is what Telegram sends.
+    """
+    import app.main as main_module
+
+    container = _container_of(target)
+    if secret is CONFIGURED_SECRET:
+        token = getattr(getattr(container, "settings", None), "WEBHOOK_SECRET", "") or ""
+    else:
+        token = secret or ""
+    request_headers = {"content-type": "application/json"}
+    if token:
+        request_headers[WEBHOOK_SECRET_HEADER] = str(token)
+    if headers:
+        request_headers.update(headers)
+
+    payload = body.encode() if isinstance(body, str) else body
+    async with asgi_client(container) as client:
+        return await client.post(
+            f"{main_module.WEBHOOK_PATH}{query}", content=payload, headers=request_headers
+        )
 
 
 def _fresh_dispatcher_module():

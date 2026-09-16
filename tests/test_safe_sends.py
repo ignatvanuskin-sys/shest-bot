@@ -415,20 +415,16 @@ def _start_payload(user_id: int = OWNER_USER_ID) -> dict:
     }
 
 
-async def _post_webhook(harness, monkeypatch, payload: dict):
-    """Call the real ``app.main.webhook`` route with the harness container wired in."""
-    import app.main as main_module
-    from starlette.requests import Request
+async def _post_webhook(harness, payload: dict):
+    """POST *payload* to the real ``app.main`` app over ASGI (the path Telegram hits).
 
-    monkeypatch.setattr(main_module, "_container", harness.container)
-    headers = []
-    secret = harness.container.settings.WEBHOOK_SECRET
-    if secret:
-        headers.append((b"x-telegram-bot-api-secret-token", secret.encode()))
-    request = Request(
-        {"type": "http", "method": "POST", "path": "/webhook", "headers": headers}
-    )
-    return await main_module.webhook(payload, request)
+    Hand-building a ``Request`` and calling the route function would hide a broken
+    route signature; the container is wired in through ``app.main._container`` by
+    the helper, exactly as production does it.
+    """
+    from tests.integration_harness import post_webhook
+
+    return await post_webhook(harness, json.dumps(payload))
 
 
 def _retry_middleware(container) -> RetryMiddleware:
@@ -443,10 +439,10 @@ async def test_webhook_returns_200_when_the_reply_cannot_be_delivered(harness, m
     break_method(monkeypatch, harness.bot, "send_message", forbidden_error())
 
     with caplog.at_level(logging.ERROR):
-        response = await _post_webhook(harness, monkeypatch, _start_payload())
+        response = await _post_webhook(harness, _start_payload())
 
     assert response.status_code == 200, "Telegram would replay the update on any non-2xx"
-    assert json.loads(response.body) == {"ok": True}
+    assert response.json() == {"ok": True}
     assert "start_greeting" in actions(caplog)
 
 
@@ -455,10 +451,10 @@ async def test_webhook_returns_200_when_the_handler_has_a_bug(harness, monkeypat
     break_method(monkeypatch, harness.bot, "send_message", TypeError("bad kwarg"))
 
     with caplog.at_level(logging.ERROR):
-        response = await _post_webhook(harness, monkeypatch, _start_payload())
+        response = await _post_webhook(harness, _start_payload())
 
     assert response.status_code == 200
-    assert json.loads(response.body) == {"ok": True}
+    assert response.json() == {"ok": True}
     assert any("unhandled exception" in r.getMessage() for r in errors(caplog))
 
 
@@ -484,7 +480,6 @@ async def test_webhook_returns_200_when_the_retry_middleware_gives_up(harness, m
     with caplog.at_level(logging.ERROR):
         response = await _post_webhook(
             harness,
-            monkeypatch,
             {
                 "update_id": 900002,
                 "message": {

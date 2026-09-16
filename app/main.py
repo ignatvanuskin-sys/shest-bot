@@ -2,16 +2,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
+from starlette.requests import ClientDisconnect
 
 from app.bot.dispatcher import feed_update, set_webhook, setup_dispatcher
 from app.config import get_settings
@@ -128,6 +129,11 @@ async def bad_request(request: Request, exc: RequestValidationError) -> JSONResp
     The webhook answers 200 with a log line: the update is unrecognisable, so a
     Telegram retry would deliver exactly the same unparseable body again (FIX-19).
     Any other route keeps the normal 422.
+
+    The webhook itself no longer relies on this handler — it reads its own body
+    (see ``webhook``) since a route parameter without a ``Body(...)`` marker is
+    parsed as a *query* parameter and never sees the body. The handler stays as
+    the safety net for any route that does declare a parsed body.
     """
     if request.url.path == WEBHOOK_PATH:
         log_json(
@@ -138,8 +144,20 @@ async def bad_request(request: Request, exc: RequestValidationError) -> JSONResp
     return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
 
 
-@app.post("/webhook")
-async def webhook(update: Any, request: Request) -> JSONResponse:
+@app.post(WEBHOOK_PATH)
+async def webhook(request: Request) -> JSONResponse:
+    """Telegram webhook.
+
+    The body is read and parsed *here*, on purpose. Declaring the payload as a
+    route parameter (``async def webhook(update: dict, ...)``) works only by
+    accident — ``dict`` happens to be treated as the body — and ``update: Any``
+    silently becomes a **required query parameter**, so every real POST (JSON
+    body, no query string) died in validation before this function ran and the
+    FIX-19 handler answered ``200 {"ok":true,"ignored":"unrecognised payload"}``.
+    Telegram got a 200 for every update, so the bot looked healthy while ignoring
+    everything. ``tests/test_webhook_asgi.py`` now drives the real ASGI app to keep
+    that from coming back.
+    """
     container = _container
     if container is None:
         raise HTTPException(status_code=503, detail="not initialised")
@@ -147,6 +165,27 @@ async def webhook(update: Any, request: Request) -> JSONResponse:
     secret = container.settings.WEBHOOK_SECRET
     if secret and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != secret:
         raise HTTPException(status_code=403, detail="bad secret")
+
+    # A body that cannot be read or parsed is not an internal error: answer 200 so
+    # Telegram does not replay it for ever, and leave a trace in the log (FIX-19).
+    try:
+        raw = await request.body()
+    except ClientDisconnect:
+        # The caller vanished mid-body; there is nothing to process and nothing to
+        # retry from Telegram's side either.
+        log_json(
+            logger, 30, "webhook client disconnected before sending the body — ignored",
+            action="webhook_bad_body",
+        )
+        return JSONResponse({"ok": True, "ignored": "unrecognised payload"})
+    try:
+        update = json.loads(raw)
+    except ValueError:
+        log_json(
+            logger, 30, "webhook body is not valid JSON — ignored",
+            action="webhook_bad_body", body_bytes=len(raw),
+        )
+        return JSONResponse({"ok": True, "ignored": "unrecognised payload"})
 
     from aiogram.types import Update
 
